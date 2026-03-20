@@ -291,12 +291,16 @@ impl Node {
             });
         }
 
-        let next = now + sample_exponential(rng, 24 * HOURS);
-        events.push(Event::SelfAnnounce {
-            node_id: self.node_id,
-            peer_addr,
-            at: next,
-        });
+        let still_connected = self.out_peers.contains_key(&peer_addr)
+            || self.in_peers.contains_key(&peer_addr);
+        if still_connected {
+            let next = now + sample_exponential(rng, 24 * HOURS);
+            events.push(Event::SelfAnnounce {
+                node_id: self.node_id,
+                peer_addr,
+                at: next,
+            });
+        }
 
         events
     }
