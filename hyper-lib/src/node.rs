@@ -6,6 +6,7 @@ use rand_distr::{Distribution, Exp};
 
 use crate::address::{AddressId, AddressRegistry, NetworkType};
 use crate::addrman::{Addrman, AddrmanEntry};
+use crate::statistics::NodeStatistics;
 
 pub type NodeId = usize;
 
@@ -20,10 +21,6 @@ const GETADDR_CACHE_LIFETIME_RAND: u64 = 6 * 3600;
 const SELF_ANNOUNCE_DELAY: u64 = 30;
 const DAYS: u64 = 86400;
 const HOURS: u64 = 3600;
-
-// Placeholder — expanded in step 4 (statistics.rs rewrite).
-#[derive(Default)]
-pub struct NodeStatistics;
 
 pub struct Node {
     pub node_id: NodeId,
