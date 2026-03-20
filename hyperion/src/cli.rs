@@ -1,60 +1,108 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use log::LevelFilter;
 
-use hyper_lib::{SimulationParameters, MAX_OUTBOUND_CONNECTIONS};
+use hyper_lib::node::GetaddrCacheAlgorithm;
+use hyper_lib::SimulationConfig;
 
-/// Default number of unreachable nodes in the simulated network.
-const UNREACHABLE_NODE_COUNT: usize = 100000;
-/// Default number of reachable nodes in the simulated network.
-const REACHABLE_NODE_COUNT: usize = (UNREACHABLE_NODE_COUNT as f32 * 0.1) as usize;
-/// Target for the transaction propagation statistics snapshot
-const TARGET_PERCENTILE: u16 = 90;
+#[derive(Clone, ValueEnum)]
+pub enum CacheAlgo {
+    Current,
+    FixedOffset,
+    NetworkBased,
+}
+
+impl From<CacheAlgo> for GetaddrCacheAlgorithm {
+    fn from(a: CacheAlgo) -> Self {
+        match a {
+            CacheAlgo::Current => GetaddrCacheAlgorithm::Current,
+            CacheAlgo::FixedOffset => GetaddrCacheAlgorithm::FixedOffset,
+            CacheAlgo::NetworkBased => GetaddrCacheAlgorithm::NetworkBased,
+        }
+    }
+}
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(name = "hyperion-addr", version, about = "Bitcoin P2P address relay simulator")]
 pub struct Cli {
-    /// The number of reachable nodes in the simulated network.
-    #[clap(long, short, default_value_t = REACHABLE_NODE_COUNT)]
-    pub reachable: usize,
-    /// The number of unreachable nodes in the simulated network.
-    #[clap(long, short, default_value_t = UNREACHABLE_NODE_COUNT, requires="reachable")]
-    pub unreachable: usize,
-    /// The number of outbound connections established per node.
-    #[clap(long, short, default_value_t = MAX_OUTBOUND_CONNECTIONS)]
+    /// Onion-only nodes
+    #[clap(long, default_value_t = 1000)]
+    pub onion: usize,
+
+    /// Clearnet-only nodes
+    #[clap(long, default_value_t = 8000)]
+    pub clearnet: usize,
+
+    /// Dual-stack nodes (one address per network)
+    #[clap(long, default_value_t = 1000)]
+    pub dual_stack: usize,
+
+    /// Percentage of clearnet addresses accepting inbound connections
+    #[clap(long, default_value_t = 15)]
+    pub reachable_clearnet_pct: u8,
+
+    /// Percentage of onion addresses accepting inbound connections
+    #[clap(long, default_value_t = 50)]
+    pub reachable_onion_pct: u8,
+
+    /// Outbound connections per node
+    #[clap(long, default_value_t = 8)]
     pub outbounds: usize,
-    /// Level of verbosity of the messages displayed by the simulator.
-    /// Possible values: [off, error, warn, info, debug, trace]
-    #[clap(long, short, verbatim_doc_comment, default_value = "info")]
-    pub log_level: LevelFilter,
-    /// Propagation percentile target. Use to measure transaction propagation times
-    #[clap(long, short, default_value_t = TARGET_PERCENTILE, value_parser = clap::value_parser!(u16).range(1..101))]
-    pub percentile_target: u16,
-    /// Whether or not nodes in the simulation support Erlay (all of them for now, this is likely to change)
+
+    /// Days to simulate
+    #[clap(long, default_value_t = 30)]
+    pub days: u64,
+
+    /// Nodes joining per day
+    #[clap(long, default_value_t = 100)]
+    pub joins_per_day: usize,
+
+    /// Nodes leaving per day
+    #[clap(long, default_value_t = 100)]
+    pub leaves_per_day: usize,
+
+    /// Start with empty addrmans (default is warm-start: pre-populated)
     #[clap(long)]
-    pub erlay: bool,
-    /// Seed to run random activity generator deterministically
+    pub cold_start: bool,
+
+    /// GETADDR cache timestamp algorithm
+    #[clap(long, default_value = "current")]
+    pub cache_algo: CacheAlgo,
+
+    /// CSV output file
+    #[clap(long)]
+    pub output_file: Option<String>,
+
+    /// Verbose output (debug log level)
+    #[clap(long, short)]
+    pub verbose: bool,
+
+    /// RNG seed for reproducibility
     #[clap(long, short)]
     pub seed: Option<u64>,
-    /// Don't add network latency to messages exchanges between peers. Useful for debugging
-    #[clap(long)]
-    pub no_latency: bool,
-    /// Number of times the simulation will be repeated. Smooths the statistical results
-    #[clap(short, default_value_t = 1)]
-    pub n: u32,
-    /// An output file name where to store simulation results to, in csv.
-    /// If the file already exists, data will be appended to it, otherwise it will be created
-    #[clap(long, visible_alias = "out", verbatim_doc_comment)]
-    pub output_file: Option<String>,
 }
 
 impl Cli {
-    pub fn verify(&self) {
-        assert!(self.reachable >= 10 * self.outbounds,
-            "Too few reachable peers. In order to allow enough randomness in the network topology generation, please make sure
-            the number of reachable nodes is, at least, 10 times the number of outbound connections per node");
+    pub fn log_level(&self) -> LevelFilter {
+        if self.verbose {
+            LevelFilter::Debug
+        } else {
+            LevelFilter::Info
+        }
     }
 
-    pub fn get_simulation_params(&self) -> SimulationParameters {
-        SimulationParameters::new(self.n, self.reachable, self.unreachable, self.erlay)
+    pub fn into_config(self) -> SimulationConfig {
+        SimulationConfig {
+            onion: self.onion,
+            clearnet: self.clearnet,
+            dual_stack: self.dual_stack,
+            reachable_clearnet_pct: self.reachable_clearnet_pct,
+            reachable_onion_pct: self.reachable_onion_pct,
+            outbounds: self.outbounds,
+            days: self.days,
+            joins_per_day: self.joins_per_day,
+            leaves_per_day: self.leaves_per_day,
+            warm_start: !self.cold_start,
+            cache_algo: self.cache_algo.into(),
+        }
     }
 }
