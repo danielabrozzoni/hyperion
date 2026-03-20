@@ -1,68 +1,17 @@
-use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
-use std::hash::Hash;
-use std::rc::Rc;
+use std::collections::{BinaryHeap, HashSet};
 
 use rand::rngs::StdRng;
-use rand::{rng, Rng, RngCore, SeedableRng};
+use rand::seq::IteratorRandom;
+use rand::{Rng, SeedableRng};
 
-use crate::network::{Link, Network, NetworkMessage};
-use crate::node::{Node, NodeId, RECON_REQUEST_INTERVAL};
-use crate::SECS_TO_NANOS;
+use crate::address::NetworkType;
+use crate::fingerprint::FingerprintAnalyzer;
+use crate::network::Network;
+use crate::node::{Event, NetworkMessage};
+use crate::statistics::{SimulationStatistics, StaleAddressStats};
+use crate::SimulationConfig;
 
-/// An enumeration of all the events that can be created in a simulation
-#[derive(Clone, Hash, Eq, PartialEq, Debug)]
-pub enum Event {
-    /// The destination (0) receives a new message (2) from given source (1)
-    ReceiveMessageFrom(NodeId, NodeId, NetworkMessage),
-    /// A given node (0) processes an scheduled announcements to a given peer (1)
-    ProcessScheduledAnnouncement(NodeId, NodeId),
-    /// A given node (0) processed a delayed request of a give transaction (1)
-    ProcessDelayedRequest(NodeId, NodeId),
-    /// Processes a scheduled reconciliation on the given node (0) with a given peer (1)
-    ProcessScheduledReconciliation(NodeId, NodeId),
-}
-
-impl Event {
-    pub fn receive_message_from(src: NodeId, dst: NodeId, msg: NetworkMessage) -> Self {
-        Event::ReceiveMessageFrom(src, dst, msg)
-    }
-
-    pub fn process_scheduled_announcement(src: NodeId, dst: NodeId) -> Self {
-        Event::ProcessScheduledAnnouncement(src, dst)
-    }
-
-    pub fn process_delayed_request(src: NodeId, dst: NodeId) -> Self {
-        Event::ProcessDelayedRequest(src, dst)
-    }
-
-    pub fn process_scheduled_reconciliation(src: NodeId, dst: NodeId) -> Self {
-        Event::ProcessScheduledReconciliation(src, dst)
-    }
-
-    pub fn is_receive_message(&self) -> bool {
-        matches!(self, Event::ReceiveMessageFrom(..))
-    }
-
-    pub fn get_message(&self) -> Option<&NetworkMessage> {
-        match self {
-            Event::ReceiveMessageFrom(_, _, m) => Some(m),
-            _ => None,
-        }
-    }
-
-    pub fn get_link(&self) -> Option<Link> {
-        match self {
-            Event::ReceiveMessageFrom(a, b, _) => Some((*a, *b).into()),
-            Event::ProcessScheduledAnnouncement(a, b) => Some((*a, *b).into()),
-            Event::ProcessDelayedRequest(a, b) => Some((*a, *b).into()),
-            Event::ProcessScheduledReconciliation(a, b) => Some((*a, *b).into()),
-        }
-    }
-}
-
-#[derive(Clone, Eq, PartialEq)]
 pub struct ScheduledEvent {
     pub inner: Event,
     time: Reverse<u64>,
@@ -81,154 +30,328 @@ impl ScheduledEvent {
     }
 }
 
+impl PartialEq for ScheduledEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.time == other.time
+    }
+}
+
+impl Eq for ScheduledEvent {}
+
 impl Ord for ScheduledEvent {
     fn cmp(&self, other: &Self) -> Ordering {
         self.time.cmp(&other.time)
     }
 }
 
-// `PartialOrd` needs to be implemented as well.
 impl PartialOrd for ScheduledEvent {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl From<ScheduledEvent> for (Event, u64) {
-    fn from(event: ScheduledEvent) -> Self {
-        let t = event.time();
-        (event.inner, t)
-    }
-}
-
 pub struct Simulator {
-    /// A pre-seeded rng to allow reproducing previous simulation results
-    rng: Rc<RefCell<StdRng>>,
-    /// The simulated network
     pub network: Network,
-    /// A queue of the events that make the simulation, ordered by discrete time
-    event_queue: BinaryHeap<ScheduledEvent>,
-    /// A cached random node identifier, initialized before the network is computed and
-    /// re-written every time get_random_nodeid is called
-    cached_node_id: NodeId,
+    pub event_queue: BinaryHeap<ScheduledEvent>,
+    pub rng: StdRng,
+    pub config: SimulationConfig,
+    pub stats: SimulationStatistics,
 }
 
 impl Simulator {
-    pub fn new(
-        reachable_count: usize,
-        unreachable_count: usize,
-        outbounds_count: usize,
-        is_erlay: bool,
-        seed: &mut Option<u64>,
-        network_latency: bool,
-    ) -> Self {
-        if let Some(s) = seed {
-            log::info!("Using user provided rng seed: {}", s);
-        } else {
-            *seed = Some(rng().next_u64());
-            log::info!("Using fresh rng seed: {}", seed.unwrap());
-        };
-        let rng = Rc::new(RefCell::new(StdRng::seed_from_u64(seed.unwrap())));
-        let random_node_id = rng
-            .borrow_mut()
-            .random_range(0..reachable_count + unreachable_count);
-
-        let network = Network::new(
-            reachable_count,
-            unreachable_count,
-            outbounds_count,
-            network_latency,
-            is_erlay,
-            rng.clone(),
-        );
-
-        Self {
-            rng,
-            network,
+    pub fn new(config: SimulationConfig, seed: u64) -> Self {
+        let mut sim = Self {
+            network: Network::new(),
             event_queue: BinaryHeap::new(),
-            cached_node_id: random_node_id,
-        }
+            rng: StdRng::seed_from_u64(seed),
+            config,
+            stats: SimulationStatistics {
+                fingerprint_results: vec![],
+                staleness_per_day: vec![],
+                avg_addrman_size: vec![],
+                address_coverage: vec![],
+            },
+        };
+        sim.build_initial_network();
+        sim
     }
 
-    pub fn schedule_set_reconciliation(&mut self, current_time: u64) {
-        if self.network.is_erlay() {
-            for node in self.network.get_nodes_mut() {
-                // Schedule transaction reconciliation here. As opposite to fanout, reconciliation is scheduled
-                // on a fixed interval. This means that we need to start it when the connection is made. However,
-                // in the simulator, the whole network is build at the same (discrete) time. This does not follow
-                // reality, so we will pick a random value between the simulation start time (current_time) and
-                // RECON_REQUEST_INTERVAL as the first scheduled reconciliation for each connection.
-                let start_time = current_time
-                    + self
-                        .rng
-                        .borrow_mut()
-                        .random_range(0..RECON_REQUEST_INTERVAL * SECS_TO_NANOS);
+    fn build_initial_network(&mut self) {
+        let now = 0u64;
 
-                // Make it so we reconcile with all peers every RECON_REQUEST_INTERVAL
-                let outbound_peers = node.get_outbounds();
-                let delta = ((RECON_REQUEST_INTERVAL as f64 / outbound_peers.len() as f64)
-                    * SECS_TO_NANOS as f64)
-                    .round() as u64;
+        // Copy all config values to locals to avoid borrow conflicts.
+        let onion = self.config.onion;
+        let clearnet = self.config.clearnet;
+        let dual_stack = self.config.dual_stack;
+        let reachable_clearnet_pct = self.config.reachable_clearnet_pct as usize;
+        let reachable_onion_pct = self.config.reachable_onion_pct as usize;
+        let outbounds = self.config.outbounds;
+        let algo = self.config.cache_algo;
+        let warm_start = self.config.warm_start;
 
-                for (i, peer_id) in outbound_peers.keys().enumerate() {
-                    // Schedule interleaved reconciliation. All outbound peers are reconciled every RECON_REQUEST_INTERVAL, with a
-                    // RECON_REQUEST_INTERVAL/N step, where N is the number of outbound peers
-                    self.event_queue.push(
-                        node.schedule_set_reconciliation(peer_id, start_time + (delta * i as u64)),
-                    );
+        let clearnet_reachable = clearnet * reachable_clearnet_pct / 100;
+        let onion_reachable = onion * reachable_onion_pct / 100;
+        let dual_clearnet_reachable = dual_stack * reachable_clearnet_pct / 100;
+        let dual_onion_reachable = dual_stack * reachable_onion_pct / 100;
+
+        for i in 0..onion {
+            let reachable_on = if i < onion_reachable {
+                [NetworkType::Onion].into()
+            } else {
+                HashSet::new()
+            };
+            let (_, events) = self.network.add_node(
+                vec![NetworkType::Onion],
+                reachable_on,
+                outbounds,
+                algo,
+                now,
+                &mut self.rng,
+            );
+            for e in events {
+                self.add_event(e);
+            }
+        }
+
+        for i in 0..clearnet {
+            let reachable_on = if i < clearnet_reachable {
+                [NetworkType::Clearnet].into()
+            } else {
+                HashSet::new()
+            };
+            let (_, events) = self.network.add_node(
+                vec![NetworkType::Clearnet],
+                reachable_on,
+                outbounds,
+                algo,
+                now,
+                &mut self.rng,
+            );
+            for e in events {
+                self.add_event(e);
+            }
+        }
+
+        for i in 0..dual_stack {
+            let mut reachable_on = HashSet::new();
+            if i < dual_onion_reachable {
+                reachable_on.insert(NetworkType::Onion);
+            }
+            if i < dual_clearnet_reachable {
+                reachable_on.insert(NetworkType::Clearnet);
+            }
+            let (_, events) = self.network.add_node(
+                vec![NetworkType::Onion, NetworkType::Clearnet],
+                reachable_on,
+                outbounds,
+                algo,
+                now,
+                &mut self.rng,
+            );
+            for e in events {
+                self.add_event(e);
+            }
+        }
+
+        if warm_start {
+            let all_addrs: Vec<_> = self
+                .network
+                .registry
+                .addresses
+                .values()
+                .map(|a| a.id)
+                .collect();
+            for node in self.network.nodes.values_mut() {
+                for &addr in &all_addrs {
+                    node.addrman.add(addr, now, 0, now);
                 }
             }
         }
     }
 
-    /// Adds an event to the event queue, adding random latency if the event is [Event::ReceiveMessageFrom].
-    /// These latencies simulate the messages traveling across the network
-    pub fn add_event(&mut self, mut scheduled_event: ScheduledEvent) {
-        let event = &scheduled_event.inner;
-        if event.is_receive_message() && self.network.has_latency() {
-            let link = &event.get_link().unwrap();
-            let latency = *self.network.get_links().get(link).unwrap_or_else(|| {
-                panic!(
-                    "No connection found between node: {} and node {}",
-                    link.a(),
-                    link.b(),
-                )
-            });
-            scheduled_event.time.0 += latency;
+    pub fn run(&mut self) {
+        for day in 0..self.config.days {
+            self.schedule_churn(day);
+            self.run_until(day * 86400 + 86399);
+            self.collect_statistics(day);
         }
-
-        self.event_queue.push(scheduled_event);
     }
 
-    /// Get the next event to be processed, as in the one with the smallest discrete time
+    fn schedule_churn(&mut self, day: u64) {
+        let day_start = day * 86400;
+        let joins = self.config.joins_per_day;
+        let leaves = self.config.leaves_per_day;
+
+        for _ in 0..joins {
+            let at = day_start + self.rng.random_range(0..86400u64);
+            self.add_event(Event::NodeJoin { at });
+        }
+        for _ in 0..leaves {
+            if let Some(&node_id) = self.network.nodes.keys().choose(&mut self.rng) {
+                let at = day_start + self.rng.random_range(0..86400u64);
+                self.add_event(Event::NodeLeave { node_id, at });
+            }
+        }
+    }
+
+    fn run_until(&mut self, end_time: u64) {
+        while let Some(se) = self.event_queue.peek() {
+            if se.time() > end_time {
+                break;
+            }
+            let se = self.event_queue.pop().unwrap();
+            let at = se.time();
+            let new_events = self.process(se.inner, at);
+            for e in new_events {
+                self.add_event(e);
+            }
+        }
+    }
+
+    fn process(&mut self, event: Event, _at: u64) -> Vec<Event> {
+        match event {
+            Event::NodeJoin { at } => {
+                let algo = self.config.cache_algo;
+                let outbounds = self.config.outbounds;
+                let (_, events) = self.network.add_node(
+                    vec![NetworkType::Clearnet],
+                    HashSet::new(),
+                    outbounds,
+                    algo,
+                    at,
+                    &mut self.rng,
+                );
+                events
+            }
+            Event::NodeLeave { node_id, at } => {
+                if self.network.nodes.contains_key(&node_id) {
+                    self.network.remove_node(node_id, at)
+                } else {
+                    vec![]
+                }
+            }
+            Event::SelfAnnounce {
+                node_id,
+                peer_addr,
+                at,
+            } => {
+                if self.network.nodes.contains_key(&node_id) {
+                    self.network
+                        .nodes
+                        .get_mut(&node_id)
+                        .unwrap()
+                        .self_announce(peer_addr, at, &mut self.rng)
+                } else {
+                    vec![]
+                }
+            }
+            Event::SendMessage { from, to, msg, at } => {
+                let to_node_id = match self.network.registry.addresses.get(&to) {
+                    Some(a) => a.owner_node,
+                    None => return vec![],
+                };
+                if !self.network.nodes.contains_key(&to_node_id) {
+                    return vec![];
+                }
+                match msg {
+                    NetworkMessage::GetAddr => self
+                        .network
+                        .nodes
+                        .get_mut(&to_node_id)
+                        .unwrap()
+                        .receive_getaddr(from, at, &mut self.rng),
+                    NetworkMessage::Addr(addrs) => {
+                        self.network
+                            .nodes
+                            .get_mut(&to_node_id)
+                            .unwrap()
+                            .receive_addr(addrs, at);
+                        vec![]
+                    }
+                    NetworkMessage::AddrAnnounce(addrs) => {
+                        let registry = &self.network.registry;
+                        self.network
+                            .nodes
+                            .get_mut(&to_node_id)
+                            .unwrap()
+                            .receive_addr_announce(from, addrs, at, registry, &mut self.rng)
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_statistics(&mut self, day: u64) {
+        let now = day * 86400 + 86399;
+        let mut analyzer = FingerprintAnalyzer::new();
+        let mut total_addrman = 0usize;
+        let mut stale_7d = 0usize;
+        let mut stale_30d = 0usize;
+        let mut departed = 0usize;
+        let node_count = self.network.nodes.len();
+
+        for (node_id, node) in &self.network.nodes {
+            if let Some(cache) = node.getaddr_cache.values().find(|c| !c.entries.is_empty()) {
+                analyzer.record(*node_id, &cache.entries);
+            }
+            for entry in node.addrman.entries.values() {
+                total_addrman += 1;
+                let age = now.saturating_sub(entry.timestamp);
+                if age > 7 * 86400 {
+                    stale_7d += 1;
+                }
+                if age > 30 * 86400 {
+                    stale_30d += 1;
+                }
+                if !self.network.registry.is_active(entry.address) {
+                    departed += 1;
+                }
+            }
+        }
+
+        self.stats.fingerprint_results.push(analyzer.analyze(day));
+        self.stats.staleness_per_day.push(StaleAddressStats {
+            day,
+            addresses_older_than_7_days: stale_7d,
+            addresses_older_than_30_days: stale_30d,
+            addresses_of_departed_nodes: departed,
+        });
+
+        let avg_size = if node_count > 0 {
+            total_addrman as f64 / node_count as f64
+        } else {
+            0.0
+        };
+        self.stats.avg_addrman_size.push(avg_size);
+
+        let total_registered = self.network.registry.addresses.len();
+        let coverage = if total_registered > 0 && node_count > 0 {
+            total_addrman as f64 / (total_registered * node_count) as f64
+        } else {
+            0.0
+        };
+        self.stats.address_coverage.push(coverage);
+    }
+
+    pub fn add_event(&mut self, event: Event) {
+        let at = event_time(&event);
+        self.event_queue.push(ScheduledEvent::new(event, at));
+    }
+
     pub fn get_next_event(&mut self) -> Option<ScheduledEvent> {
         self.event_queue.pop()
     }
 
-    /// Get the time when the next event will be processed
     pub fn get_next_event_time(&mut self) -> Option<u64> {
-        let scheduled_event = self.event_queue.peek()?;
-        Some(scheduled_event.time())
+        self.event_queue.peek().map(|se| se.time())
     }
+}
 
-    pub fn get_random_nodeid(&mut self) -> NodeId {
-        let random_node_id = self.cached_node_id;
-        self.cached_node_id = self
-            .rng
-            .borrow_mut()
-            .random_range(0..self.network.get_node_count());
-        random_node_id
-    }
-
-    pub fn get_node(&self, node_id: NodeId) -> Option<&Node> {
-        self.network.get_node(node_id)
-    }
-
-    pub fn get_node_mut(&mut self, node_id: NodeId) -> Option<&mut Node> {
-        self.network.get_node_mut(node_id)
-    }
-
-    pub fn get_nodes(&self) -> &Vec<Node> {
-        self.network.get_nodes()
+fn event_time(event: &Event) -> u64 {
+    match event {
+        Event::SendMessage { at, .. } => *at,
+        Event::NodeJoin { at, .. } => *at,
+        Event::NodeLeave { at, .. } => *at,
+        Event::SelfAnnounce { at, .. } => *at,
     }
 }

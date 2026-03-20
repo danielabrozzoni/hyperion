@@ -49,6 +49,7 @@ pub struct GetaddrCache {
     pub expires_at: u64,
 }
 
+#[derive(Clone, Copy)]
 pub enum GetaddrCacheAlgorithm {
     /// Real timestamp from addrman (Bitcoin Core baseline).
     Current,
