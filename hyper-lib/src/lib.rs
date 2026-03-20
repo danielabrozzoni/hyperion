@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use statistics::NetworkStatistics;
 
+pub mod address;
 pub mod network;
 pub mod node;
 pub mod simulator;
