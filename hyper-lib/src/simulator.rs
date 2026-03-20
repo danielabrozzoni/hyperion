@@ -226,12 +226,14 @@ impl Simulator {
             let s = self.stats.staleness_per_day.last().unwrap();
             let f = self.stats.fingerprint_results.last().unwrap();
             log::debug!(
-                "  addrman_avg={:.0}  stale_7d={}  stale_30d={}  departed={}  fp_pairs={}",
+                "  addrman_avg={:.0}  stale_7d={}  stale_30d={}  departed={}  \
+                 fp_overlap={:.4}  fp_nodes={}",
                 self.stats.avg_addrman_size.last().unwrap(),
                 s.addresses_older_than_7_days,
                 s.addresses_older_than_30_days,
                 s.addresses_of_departed_nodes,
-                f.node_pairs_same_fingerprint,
+                f.avg_overlap,
+                f.nodes_sampled,
             );
         }
     }
@@ -350,8 +352,10 @@ impl Simulator {
         let node_count = self.network.nodes.len();
 
         for (node_id, node) in &self.network.nodes {
-            if let Some(cache) = node.getaddr_cache.values().find(|c| !c.entries.is_empty()) {
-                analyzer.record(*node_id, &cache.entries);
+            for (network, cache) in &node.getaddr_cache {
+                if !cache.entries.is_empty() {
+                    analyzer.record(*node_id, *network, &cache.entries);
+                }
             }
             for entry in node.addrman.entries.values() {
                 total_addrman += 1;

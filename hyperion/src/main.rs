@@ -17,8 +17,8 @@ struct DayRow {
     stale_7d: usize,
     stale_30d: usize,
     stale_departed: usize,
-    fingerprint_pairs: usize,
-    fingerprint_fpr: f64,
+    fp_dual_stack_nodes: usize,
+    fp_avg_overlap: f64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,23 +53,23 @@ fn main() -> anyhow::Result<()> {
             stale_7d: stats.staleness_per_day[i].addresses_older_than_7_days,
             stale_30d: stats.staleness_per_day[i].addresses_older_than_30_days,
             stale_departed: stats.staleness_per_day[i].addresses_of_departed_nodes,
-            fingerprint_pairs: stats.fingerprint_results[i].node_pairs_same_fingerprint,
-            fingerprint_fpr: stats.fingerprint_results[i].false_positive_rate,
+            fp_dual_stack_nodes: stats.fingerprint_results[i].nodes_sampled,
+            fp_avg_overlap: stats.fingerprint_results[i].avg_overlap,
         })
         .collect();
 
     for row in &rows {
         log::info!(
             "Day {:>2}: addrman_avg={:.1}  coverage={:.4}  stale_7d={}  stale_30d={}  \
-             departed={}  fp_pairs={}  fp_rate={:.6}",
+             departed={}  fp_overlap={:.4}  fp_nodes={}",
             row.day,
             row.avg_addrman_size,
             row.address_coverage,
             row.stale_7d,
             row.stale_30d,
             row.stale_departed,
-            row.fingerprint_pairs,
-            row.fingerprint_fpr,
+            row.fp_avg_overlap,
+            row.fp_dual_stack_nodes,
         );
     }
 

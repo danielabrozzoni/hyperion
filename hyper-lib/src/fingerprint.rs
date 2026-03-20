@@ -1,61 +1,64 @@
 use std::collections::HashMap;
 
-use crate::address::AddressId;
+use crate::address::{AddressId, NetworkType};
 use crate::node::{AddrPayload, NodeId};
 use crate::statistics::FingerprintResult;
 
 pub struct FingerprintAnalyzer {
-    /// Sorted (address, timestamp) pairs per node, collected daily.
-    responses: HashMap<NodeId, Vec<(AddressId, u64)>>,
+    clearnet: HashMap<NodeId, Vec<(AddressId, u64)>>,
+    onion: HashMap<NodeId, Vec<(AddressId, u64)>>,
 }
 
 impl FingerprintAnalyzer {
     pub fn new() -> Self {
         FingerprintAnalyzer {
-            responses: HashMap::new(),
+            clearnet: HashMap::new(),
+            onion: HashMap::new(),
         }
     }
 
-    /// Record a node's GETADDR cache for today's sample.
-    pub fn record(&mut self, node_id: NodeId, cache: &[AddrPayload]) {
+    /// Record a node's GETADDR cache for a given network.
+    pub fn record(&mut self, node_id: NodeId, network: NetworkType, cache: &[AddrPayload]) {
         let mut pairs: Vec<_> = cache.iter().map(|p| (p.address, p.timestamp)).collect();
         pairs.sort_unstable();
-        self.responses.insert(node_id, pairs);
+        match network {
+            NetworkType::Clearnet => self.clearnet.insert(node_id, pairs),
+            NetworkType::Onion => self.onion.insert(node_id, pairs),
+        };
     }
 
-    /// Compare all pairs of nodes, return fingerprint collision stats.
-    /// "Same fingerprint" = Jaccard similarity == 1.0 (identical caches).
+    /// For each dual-stack node (one with both a clearnet and onion cache),
+    /// compute what fraction of (addr, ts) pairs appear in both responses.
+    /// Returns the average overlap across all such nodes.
     pub fn analyze(&self, day: u64) -> FingerprintResult {
-        let nodes: Vec<&Vec<(AddressId, u64)>> = self.responses.values().collect();
-        let n = nodes.len();
-        let total_pairs = n.saturating_sub(1) * n / 2;
-        let mut same_fingerprint = 0usize;
+        let mut total_overlap = 0.0;
+        let mut nodes_sampled = 0;
 
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if Self::similarity(nodes[i], nodes[j]) == 1.0 {
-                    same_fingerprint += 1;
-                }
+        for (node_id, clearnet_cache) in &self.clearnet {
+            if let Some(onion_cache) = self.onion.get(node_id) {
+                total_overlap += Self::overlap(clearnet_cache, onion_cache);
+                nodes_sampled += 1;
             }
         }
 
-        let false_positive_rate = if total_pairs > 0 {
-            same_fingerprint as f64 / total_pairs as f64
+        let avg_overlap = if nodes_sampled > 0 {
+            total_overlap / nodes_sampled as f64
         } else {
             0.0
         };
 
         FingerprintResult {
             day,
-            node_pairs_same_fingerprint: same_fingerprint,
-            false_positive_rate,
+            avg_overlap,
+            nodes_sampled,
         }
     }
 
-    /// Jaccard similarity over sorted (address, timestamp) pairs.
-    pub fn similarity(a: &[(AddressId, u64)], b: &[(AddressId, u64)]) -> f64 {
-        if a.is_empty() && b.is_empty() {
-            return 1.0;
+    /// Fraction of pairs from `a` that also appear in `b`.
+    /// Both slices must be sorted. Returns 0.0 if `a` is empty.
+    pub fn overlap(a: &[(AddressId, u64)], b: &[(AddressId, u64)]) -> f64 {
+        if a.is_empty() {
+            return 0.0;
         }
         let mut intersection = 0usize;
         let mut ai = 0;
@@ -71,11 +74,6 @@ impl FingerprintAnalyzer {
                 std::cmp::Ordering::Greater => bi += 1,
             }
         }
-        let union = a.len() + b.len() - intersection;
-        if union == 0 {
-            1.0
-        } else {
-            intersection as f64 / union as f64
-        }
+        intersection as f64 / a.len() as f64
     }
 }

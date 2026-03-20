@@ -19,8 +19,12 @@ pub struct SimulationStatistics {
 
 pub struct FingerprintResult {
     pub day: u64,
-    pub node_pairs_same_fingerprint: usize,
-    pub false_positive_rate: f64,
+    /// Average fraction of (addr, ts) pairs shared between a dual-stack node's
+    /// clearnet and onion GETADDR caches. High overlap means an attacker can
+    /// link the node's clearnet and Tor identities by comparing responses.
+    pub avg_overlap: f64,
+    /// Number of dual-stack nodes that had both caches populated this day.
+    pub nodes_sampled: usize,
 }
 
 pub struct StaleAddressStats {
