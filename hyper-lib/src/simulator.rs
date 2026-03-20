@@ -103,6 +103,8 @@ impl Simulator {
             total, onion, clearnet, dual_stack, outbounds
         );
 
+        let t_build = std::time::Instant::now();
+
         for i in 0..onion {
             let reachable_on = if i < onion_reachable {
                 [NetworkType::Onion].into()
@@ -168,14 +170,23 @@ impl Simulator {
             dual_stack, dual_onion_reachable, dual_clearnet_reachable
         );
         log::info!(
-            "Network ready: {} nodes, {} addresses, {} queued events",
+            "Network topology built in {:.2?}: {} nodes, {} addresses, {} queued events",
+            t_build.elapsed(),
             self.network.nodes.len(),
             self.network.registry.addresses.len(),
             self.event_queue.len()
         );
 
         if warm_start {
-            log::info!("Warm-starting addrmans...");
+            let addr_count = self.network.registry.addresses.len();
+            let node_count = self.network.nodes.len();
+            log::info!(
+                "Warm-starting addrmans: {} inserts ({} nodes × {} addresses)...",
+                node_count * addr_count,
+                node_count,
+                addr_count,
+            );
+            let t_warm = std::time::Instant::now();
             let all_addrs: Vec<_> = self
                 .network
                 .registry
@@ -183,15 +194,20 @@ impl Simulator {
                 .values()
                 .map(|a| a.id)
                 .collect();
-            for node in self.network.nodes.values_mut() {
+            for (i, node) in self.network.nodes.values_mut().enumerate() {
                 for &addr in &all_addrs {
                     node.addrman.add(addr, now, 0, now);
                 }
+                if (i + 1) % 1000 == 0 {
+                    log::debug!(
+                        "  warm-start: {}/{} nodes done ({:.2?} elapsed)",
+                        i + 1,
+                        node_count,
+                        t_warm.elapsed()
+                    );
+                }
             }
-            log::info!(
-                "Warm-start done: {} addresses loaded into each addrman",
-                all_addrs.len()
-            );
+            log::info!("Warm-start done in {:.2?}", t_warm.elapsed());
         }
     }
 
