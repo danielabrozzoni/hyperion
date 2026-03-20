@@ -77,7 +77,10 @@ impl Simulator {
     }
 
     fn build_initial_network(&mut self) {
-        let now = 0u64;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         // Copy all config values to locals to avoid borrow conflicts.
         let onion = self.config.onion;
