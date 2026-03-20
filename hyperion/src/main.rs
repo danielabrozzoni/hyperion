@@ -1,194 +1,95 @@
-use std::{path::PathBuf, str::FromStr};
+use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::Parser;
-use indicatif::{ProgressIterator, ProgressStyle};
-use log::LevelFilter;
+use rand::{rng, RngCore};
+use serde::Serialize;
 use simple_logger::SimpleLogger;
 
-use hyper_lib::simulator::{Event, Simulator};
+use hyper_lib::simulator::Simulator;
 use hyperion::cli::Cli;
 
+#[derive(Serialize)]
+struct DayRow {
+    day: u64,
+    avg_addrman_size: f64,
+    address_coverage: f64,
+    stale_7d: usize,
+    stale_30d: usize,
+    stale_departed: usize,
+    fingerprint_pairs: usize,
+    fingerprint_fpr: f64,
+}
+
 fn main() -> anyhow::Result<()> {
-    let mut cli = Cli::parse();
-    cli.verify();
+    let cli = Cli::parse();
+    let log_level = cli.log_level();
 
     SimpleLogger::new()
-        .with_level(LevelFilter::Warn)
-        .with_module_level("hyper_lib", cli.log_level)
-        .with_module_level("hyperion", cli.log_level)
+        .with_level(log::LevelFilter::Warn)
+        .with_module_level("hyper_lib", log_level)
+        .with_module_level("hyperion", log_level)
         .init()
         .unwrap();
 
-    let node_count = cli.reachable + cli.unreachable;
-    let target_node_count = node_count as f32 * (cli.percentile_target as f32 / 100.0);
-    let mut simulator = Simulator::new(
-        cli.reachable,
-        cli.unreachable,
-        cli.outbounds,
-        cli.erlay,
-        &mut cli.seed,
-        !cli.no_latency,
-    );
-    if cli.n > 1 {
+    let seed = cli.seed.unwrap_or_else(|| rng().next_u64());
+    log::info!("RNG seed: {seed}");
+
+    let output_file = cli.output_file.clone();
+    let config = cli.into_config();
+
+    log::info!("Building network and running simulation...");
+    let mut simulator = Simulator::new(config, seed);
+    simulator.run();
+
+    let stats = &simulator.stats;
+    let days = stats.avg_addrman_size.len();
+
+    let rows: Vec<DayRow> = (0..days)
+        .map(|i| DayRow {
+            day: stats.staleness_per_day[i].day,
+            avg_addrman_size: stats.avg_addrman_size[i],
+            address_coverage: stats.address_coverage[i],
+            stale_7d: stats.staleness_per_day[i].addresses_older_than_7_days,
+            stale_30d: stats.staleness_per_day[i].addresses_older_than_30_days,
+            stale_departed: stats.staleness_per_day[i].addresses_of_departed_nodes,
+            fingerprint_pairs: stats.fingerprint_results[i].node_pairs_same_fingerprint,
+            fingerprint_fpr: stats.fingerprint_results[i].false_positive_rate,
+        })
+        .collect();
+
+    for row in &rows {
         log::info!(
-            "The simulation will be run {} times and results will be averaged",
-            cli.n
+            "Day {:>2}: addrman_avg={:.1}  coverage={:.4}  stale_7d={}  stale_30d={}  \
+             departed={}  fp_pairs={}  fp_rate={:.6}",
+            row.day,
+            row.avg_addrman_size,
+            row.address_coverage,
+            row.stale_7d,
+            row.stale_30d,
+            row.stale_departed,
+            row.fingerprint_pairs,
+            row.fingerprint_fpr,
         );
     }
 
-    let start_time = 0;
-    let mut overall_propagation_time = 0;
-    let mut overall_time = 0;
-
-    // Display a progress bar only if we are running in multi-simulation mode
-    let sty = ProgressStyle::with_template(if cli.n > 1 {
-        "Simulating [{wide_bar:.cyan/blue} {pos:>2}/{len:2}] {elapsed_precise}"
-    } else {
-        ""
-    })
-    .unwrap()
-    .progress_chars("##-");
-
-    for _ in (0..cli.n).progress().with_style(sty) {
-        // Pick a (source) node to broadcast the target transaction from
-        let source_node_id = simulator.get_random_nodeid();
-        log::debug!(
-            "Starting simulation: broadcasting transaction from node {source_node_id} ({})",
-            if source_node_id < cli.reachable {
-                "reachable"
-            } else {
-                "unreachable"
-            }
-        );
-
-        // For statistical purposes
-        let mut nodes_reached = 1;
-        let mut percentile_time = 0;
-        let mut propagation_time = 0;
-
-        // Bootstrap the set reconciliation events (if needed) and send out the transaction.
-        // All simulations start at time 0 so we don't have to carry any offset when computing
-        // the overall time
-        simulator.schedule_set_reconciliation(start_time);
-        for e in simulator
-            .get_node_mut(source_node_id)
-            .unwrap()
-            .broadcast_tx(start_time)
-        {
-            simulator.add_event(e);
+    if let Some(of) = output_file {
+        let mut path = PathBuf::from_str(&of)?;
+        if let Some(rest) = of.strip_prefix("~/") {
+            path = home::home_dir().unwrap().join(rest);
         }
-        // Record the initial time as the time when the first node sends out the transaction.
-        // We don't need to account for the time the source withholds it
-        let first_seen_time = simulator.get_next_event_time().unwrap();
-
-        // Process events until the queue is empty
-        while let Some(scheduled_event) = simulator.get_next_event() {
-            let (event, current_time) = scheduled_event.into();
-            match event {
-                Event::ReceiveMessageFrom(src, dst, msg) => {
-                    if msg.is_tx() {
-                        nodes_reached += 1;
-                        if percentile_time == 0 && nodes_reached as f32 >= target_node_count {
-                            percentile_time = current_time - first_seen_time;
-                        } else if nodes_reached == node_count {
-                            propagation_time = current_time - first_seen_time;
-                        }
-                    }
-                    for future_event in simulator
-                        .network
-                        .get_node_mut(dst)
-                        .unwrap()
-                        .receive_message_from(msg, src, current_time)
-                    {
-                        simulator.add_event(future_event);
-                    }
-                }
-                Event::ProcessScheduledAnnouncement(src, dst) => {
-                    if let Some(scheduled_event) = simulator
-                        .network
-                        .get_node_mut(src)
-                        .unwrap()
-                        .process_scheduled_announcement(dst, current_time)
-                    {
-                        simulator.add_event(scheduled_event);
-                    }
-                }
-                Event::ProcessDelayedRequest(target, peer_id) => {
-                    if let Some(delayed_event) = simulator
-                        .network
-                        .get_node_mut(target)
-                        .unwrap()
-                        .process_delayed_request(peer_id, current_time)
-                    {
-                        simulator.add_event(delayed_event);
-                    }
-                }
-                Event::ProcessScheduledReconciliation(src, dst) => {
-                    for event in simulator
-                        .network
-                        .get_node_mut(src)
-                        .unwrap()
-                        .process_scheduled_reconciliation(&dst, current_time)
-                    {
-                        simulator.add_event(event);
-                    }
-                }
-            }
-        }
-
-        // Make sure every node has received the transaction
-        for node in simulator.network.get_nodes() {
-            assert!(node.knows_transaction());
-            for peer in node.get_outbounds().values() {
-                assert!(peer.already_announced())
-            }
-        }
-
-        assert_ne!(percentile_time, 0);
-        overall_time += percentile_time;
-        overall_propagation_time += propagation_time;
-
-        for node in simulator.network.get_nodes_mut() {
-            node.reset();
-        }
-    }
-
-    let avg_percentile_time = (overall_time as f32 / cli.n as f32).round() as u64;
-    let avg_propagation_time = (overall_propagation_time as f32 / cli.n as f32).round() as u64;
-    let statistics = simulator.network.get_statistics();
-    let output_result = hyper_lib::OutputResult::new(
-        cli.percentile_target,
-        avg_percentile_time,
-        avg_propagation_time,
-        statistics,
-        cli.get_simulation_params(),
-        cli.seed.unwrap(),
-    );
-    output_result.display();
-
-    // Store data in csv to the specified output file (if any)
-    if let Some(of) = cli.output_file {
-        let mut output_file = PathBuf::from_str(&of)?;
-        if let Some(a) = of.strip_prefix('~') {
-            if let Some(b) = of.strip_prefix("~/") {
-                output_file = home::home_dir().unwrap().join(b)
-            } else {
-                output_file = home::home_dir().unwrap().join(a)
-            }
-        };
-
-        log::info!("Storing results in {}", output_file.to_str().unwrap());
+        log::info!("Writing results to {}", path.display());
         let mut wtr = csv::WriterBuilder::new()
-            // Only add headers if the file doesn't exist. Assume file is properly formatted otherwise
-            .has_headers(!std::fs::exists(&output_file)?)
+            .has_headers(!std::fs::exists(&path)?)
             .from_writer(
                 std::fs::OpenOptions::new()
-                    // create if missing + append
                     .create(true)
                     .append(true)
-                    .open(&output_file)?,
+                    .open(&path)?,
             );
-        wtr.serialize(output_result)?;
+        for row in rows {
+            wtr.serialize(row)?;
+        }
         wtr.flush()?;
     }
 
