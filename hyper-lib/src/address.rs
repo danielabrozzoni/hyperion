@@ -2,13 +2,13 @@ use std::collections::HashMap;
 
 use crate::node::NodeId;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct AddressId {
     pub id: u64,
     pub network: NetworkType,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum NetworkType {
     Onion,
     Clearnet,
