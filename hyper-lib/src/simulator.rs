@@ -97,6 +97,12 @@ impl Simulator {
         let dual_clearnet_reachable = dual_stack * reachable_clearnet_pct / 100;
         let dual_onion_reachable = dual_stack * reachable_onion_pct / 100;
 
+        let total = onion + clearnet + dual_stack;
+        log::info!(
+            "Building network: {} nodes ({} onion, {} clearnet, {} dual-stack), {} outbounds each",
+            total, onion, clearnet, dual_stack, outbounds
+        );
+
         for i in 0..onion {
             let reachable_on = if i < onion_reachable {
                 [NetworkType::Onion].into()
@@ -115,6 +121,7 @@ impl Simulator {
                 self.add_event(e);
             }
         }
+        log::debug!("Added {} onion-only nodes ({} reachable)", onion, onion_reachable);
 
         for i in 0..clearnet {
             let reachable_on = if i < clearnet_reachable {
@@ -134,6 +141,7 @@ impl Simulator {
                 self.add_event(e);
             }
         }
+        log::debug!("Added {} clearnet-only nodes ({} reachable)", clearnet, clearnet_reachable);
 
         for i in 0..dual_stack {
             let mut reachable_on = HashSet::new();
@@ -155,8 +163,19 @@ impl Simulator {
                 self.add_event(e);
             }
         }
+        log::debug!(
+            "Added {} dual-stack nodes ({} onion-reachable, {} clearnet-reachable)",
+            dual_stack, dual_onion_reachable, dual_clearnet_reachable
+        );
+        log::info!(
+            "Network ready: {} nodes, {} addresses, {} queued events",
+            self.network.nodes.len(),
+            self.network.registry.addresses.len(),
+            self.event_queue.len()
+        );
 
         if warm_start {
+            log::info!("Warm-starting addrmans...");
             let all_addrs: Vec<_> = self
                 .network
                 .registry
@@ -169,14 +188,35 @@ impl Simulator {
                     node.addrman.add(addr, now, 0, now);
                 }
             }
+            log::info!(
+                "Warm-start done: {} addresses loaded into each addrman",
+                all_addrs.len()
+            );
         }
     }
 
     pub fn run(&mut self) {
         for day in 0..self.config.days {
+            log::info!(
+                "Day {}/{} — queue: {} events, nodes: {}",
+                day + 1,
+                self.config.days,
+                self.event_queue.len(),
+                self.network.nodes.len()
+            );
             self.schedule_churn(day);
             self.run_until(day * 86400 + 86399);
             self.collect_statistics(day);
+            let s = self.stats.staleness_per_day.last().unwrap();
+            let f = self.stats.fingerprint_results.last().unwrap();
+            log::debug!(
+                "  addrman_avg={:.0}  stale_7d={}  stale_30d={}  departed={}  fp_pairs={}",
+                self.stats.avg_addrman_size.last().unwrap(),
+                s.addresses_older_than_7_days,
+                s.addresses_older_than_30_days,
+                s.addresses_of_departed_nodes,
+                f.node_pairs_same_fingerprint,
+            );
         }
     }
 
