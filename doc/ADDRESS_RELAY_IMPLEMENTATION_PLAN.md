@@ -666,8 +666,11 @@ pub struct SimulationStatistics {
 
 pub struct FingerprintResult {
     pub day: u64,
-    pub node_pairs_same_fingerprint: usize,
-    pub false_positive_rate: f64,
+    /// Number of dual-stack nodes whose clearnet and onion caches share at least one address.
+    pub dual_stack_nodes_with_shared_addresses: usize,
+    /// Among shared addresses, fraction that also have matching timestamps across both caches.
+    /// High overlap means the two network identities are linkable (high fingerprinting surface).
+    pub cross_network_timestamp_overlap: f64,
 }
 
 pub struct StaleAddressStats {
@@ -678,24 +681,36 @@ pub struct StaleAddressStats {
 }
 
 // fingerprint.rs
+//
+// The fingerprinting attack: an observer connects to a dual-stack node once via clearnet and
+// once via onion, issues GETADDR on each connection, and compares the (address, timestamp) pairs.
+// If timestamps for shared addresses match across both caches, the observer can link the two
+// network identities to the same physical node. FingerprintAnalyzer measures this exposure.
 pub struct FingerprintAnalyzer {
-    /// Sorted (address, timestamp) pairs per node, collected daily.
-    responses: HashMap<NodeId, Vec<(AddressId, u64)>>,
+    /// Per-node, per-network sorted (address, timestamp) pairs, collected daily.
+    /// Only dual-stack nodes (those with entries for both Clearnet and Onion) are analysed.
+    responses: HashMap<NodeId, HashMap<NetworkType, Vec<(AddressId, u64)>>>,
 }
 
 impl FingerprintAnalyzer {
-    /// Record a node's GETADDR cache for today's sample.
-    pub fn record(&mut self, node_id: NodeId, cache: &[AddrPayload]) {
+    /// Record one network's GETADDR cache for a node.
+    /// Call once for Clearnet and once for Onion on each dual-stack node per day.
+    pub fn record(&mut self, node_id: NodeId, network: NetworkType, cache: &[AddrPayload]) {
         let mut pairs: Vec<_> = cache.iter().map(|p| (p.address, p.timestamp)).collect();
         pairs.sort();
-        self.responses.insert(node_id, pairs);
+        self.responses.entry(node_id).or_default().insert(network, pairs);
     }
 
-    /// Compare all pairs of nodes, return fingerprint collision stats.
+    /// For each dual-stack node with both a Clearnet and Onion cache, compute the fraction of
+    /// shared addresses that also have matching timestamps. Returns aggregate stats for the day.
     pub fn analyze(&self) -> FingerprintResult { ... }
 
-    /// Jaccard similarity over (address, timestamp) pairs.
-    pub fn similarity(a: &[(AddressId, u64)], b: &[(AddressId, u64)]) -> f64 { ... }
+    /// Fraction of addresses appearing in both slices that have identical timestamps.
+    /// Input slices must be sorted by AddressId.
+    pub fn cross_network_overlap(
+        clearnet: &[(AddressId, u64)],
+        onion: &[(AddressId, u64)],
+    ) -> f64 { ... }
 }
 ```
 
@@ -741,8 +756,12 @@ FOR day IN 0..config.days:
 
     // Daily statistics snapshot:
     for each node:
-        record GETADDR cache into FingerprintAnalyzer
+        for each network this node is active on:
+            record that network's GETADDR cache into FingerprintAnalyzer
         count addrman entries by timestamp age and active/departed status
+    // FingerprintAnalyzer.analyze() only considers dual-stack nodes (those with
+    // both a Clearnet and Onion cache recorded). It measures what fraction of
+    // shared addresses have matching timestamps across the two caches.
     compute and store FingerprintResult + StaleAddressStats for this day
 
 output results

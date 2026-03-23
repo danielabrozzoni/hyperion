@@ -4,7 +4,7 @@
 
 We want to study how different GETADDR cache timestamp algorithms affect the Bitcoin P2P network. Two specific questions:
 
-1. **Fingerprinting:** can an observer distinguish two nodes by their GETADDR responses? When two nodes return the same (address, timestamp) pairs, they can be identified as the same node across connections. We want to measure how much fingerprinting surface each algorithm exposes.
+1. **Fingerprinting:** can an observer link a node's clearnet identity to its onion identity? A dual-stack node answers GETADDR on both networks. If the cached timestamps for shared addresses are identical across both networks, an observer who connects once via clearnet and once via onion can compare the `(address, timestamp)` pairs and determine that both connections lead to the same physical node — defeating the privacy benefit of Tor. We want to measure how much cross-network fingerprinting surface each algorithm exposes.
 
 2. **Staleness:** do departed nodes' addresses persist in addrmans longer than they should? Some algorithms send artificially old timestamps, which slows down the natural aging-out of stale entries via `IsTerrible()`. We want to measure how long departed nodes stay visible in the network.
 

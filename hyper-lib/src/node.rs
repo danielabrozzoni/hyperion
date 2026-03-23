@@ -10,10 +10,28 @@ use crate::statistics::NodeStatistics;
 
 pub type NodeId = usize;
 
-macro_rules! debug_log {
-    ($time:tt, $id:expr, $($arg:tt)*)
-    =>
-    (log::debug!("{}: [Node: {}] {}", $time, $id, &format!($($arg)*)));
+macro_rules! protocol_log {
+    ($time:expr, $id:expr, $($arg:tt)*) => {
+        log::debug!(target: "hyper_lib::protocol", "t={} node={} {}", $time, $id, format!($($arg)*));
+    };
+}
+
+macro_rules! protocol_trace {
+    ($time:expr, $id:expr, $($arg:tt)*) => {
+        log::trace!(target: "hyper_lib::protocol", "t={} node={} {}", $time, $id, format!($($arg)*));
+    };
+}
+
+macro_rules! topology_log {
+    ($time:expr, $id:expr, $($arg:tt)*) => {
+        log::debug!(target: "hyper_lib::topology", "t={} node={} {}", $time, $id, format!($($arg)*));
+    };
+}
+
+macro_rules! topology_trace {
+    ($time:expr, $id:expr, $($arg:tt)*) => {
+        log::trace!(target: "hyper_lib::topology", "t={} node={} {}", $time, $id, format!($($arg)*));
+    };
 }
 
 const GETADDR_CACHE_LIFETIME_BASE: u64 = 21 * 3600;
@@ -65,12 +83,14 @@ pub struct AddrPayload {
     pub timestamp: u64,
 }
 
+#[derive(Clone)]
 pub enum NetworkMessage {
     GetAddr,
     Addr(Vec<AddrPayload>),
     AddrAnnounce(Vec<AddrPayload>),
 }
 
+#[derive(Clone)]
 pub enum Event {
     SendMessage { from: AddressId, to: AddressId, msg: NetworkMessage, at: u64 },
     NodeJoin { at: u64 },
@@ -85,13 +105,6 @@ impl Node {
             .find(|a| a.network == network)
             .copied()
             .expect("connected on a network we don't have an address for")
-    }
-
-    fn peer(&self, addr: AddressId) -> &Peer {
-        self.out_peers
-            .get(&addr)
-            .or_else(|| self.in_peers.get(&addr))
-            .expect("peer not found")
     }
 
     fn peer_mut(&mut self, addr: AddressId) -> &mut Peer {
@@ -110,7 +123,7 @@ impl Node {
     ) -> u64 {
         match self.cache_algo {
             GetaddrCacheAlgorithm::Current => entry.timestamp,
-            GetaddrCacheAlgorithm::FixedOffset => now - rng.gen_range(8..=12) * DAYS,
+            GetaddrCacheAlgorithm::FixedOffset => now - rng.random_range(8..=12) * DAYS,
             GetaddrCacheAlgorithm::NetworkBased => {
                 if entry.address.network == cache_network {
                     entry.timestamp
@@ -123,6 +136,7 @@ impl Node {
 
     fn build_cache(&mut self, network: NetworkType, now: u64, rng: &mut impl Rng) {
         let selected = self.addrman.get_addr(now, rng);
+        protocol_trace!(now, self.node_id, "build_cache net={network:?} size={}", selected.len());
         let entries = selected
             .into_iter()
             .map(|e| AddrPayload {
@@ -137,7 +151,7 @@ impl Node {
                 entries,
                 expires_at: now
                     + GETADDR_CACHE_LIFETIME_BASE
-                    + rng.gen_range(0..GETADDR_CACHE_LIFETIME_RAND),
+                    + rng.random_range(0..GETADDR_CACHE_LIFETIME_RAND),
             },
         );
     }
@@ -160,17 +174,24 @@ impl Node {
             "peer {from:?} sent GETADDR twice on the same connection"
         );
         peer.getaddr_recvd = true;
+        self.node_statistics.getaddr_received += 1;
 
         let network = from.network;
-        if self
+        let cache_hit = self
             .getaddr_cache
             .get(&network)
-            .map_or(true, |c| now >= c.expires_at)
-        {
+            .map_or(false, |c| now < c.expires_at);
+        if !cache_hit {
             self.build_cache(network, now, rng);
         }
-
         let entries = self.getaddr_cache[&network].entries.clone();
+        protocol_log!(
+            now, self.node_id,
+            "GETADDR from={from:?} → {} addrs (cache {})",
+            entries.len(),
+            if cache_hit { "hit" } else { "miss" }
+        );
+        self.node_statistics.addr_sent += 1;
         vec![Event::SendMessage {
             from: self.own_addr_for_network(network),
             to: from,
@@ -180,6 +201,8 @@ impl Node {
     }
 
     pub fn receive_addr(&mut self, addrs: Vec<AddrPayload>, now: u64) {
+        protocol_log!(now, self.node_id, "ADDR {} entries", addrs.len());
+        self.node_statistics.addr_received += 1;
         const PENALTY: u64 = 2 * HOURS;
         for payload in addrs {
             self.addrman
@@ -196,6 +219,8 @@ impl Node {
         rng: &mut impl Rng,
     ) -> Vec<Event> {
         let batch_size = addrs.len();
+        protocol_log!(now, self.node_id, "AddrAnnounce {batch_size} entries from={from:?}");
+        self.node_statistics.addr_announce_received += 1;
         let mut events = vec![];
 
         for payload in &addrs {
@@ -208,7 +233,9 @@ impl Node {
             return events;
         }
 
-        let peer_sent_getaddr = self.peer(from).getaddr_sent;
+        let peer_sent_getaddr = self.out_peers.get(&from)
+            .or_else(|| self.in_peers.get(&from))
+            .map_or(false, |p| p.getaddr_sent);
 
         for payload in addrs {
             if payload.timestamp < now.saturating_sub(10 * 60) {
@@ -224,6 +251,7 @@ impl Node {
             let n_relay = self.relay_count(payload.address, registry, rng);
             let targets = self.select_relay_peers(from, n_relay, rng);
             for target in targets {
+                protocol_trace!(now, self.node_id, "  relay addr={:?} → peer={target:?}", payload.address);
                 events.push(Event::SendMessage {
                     from: self.own_addr_for_network(target.network),
                     to: target,
@@ -233,6 +261,7 @@ impl Node {
             }
         }
 
+        self.node_statistics.addr_announce_sent += events.len() as u64;
         events
     }
 
@@ -245,7 +274,7 @@ impl Node {
         if registry.is_reachable(addr) {
             2
         } else {
-            rng.gen_range(1..=2)
+            rng.random_range(1..=2)
         }
     }
 
@@ -269,6 +298,7 @@ impl Node {
         now: u64,
         rng: &mut impl Rng,
     ) -> Vec<Event> {
+        protocol_log!(now, self.node_id, "SelfAnnounce to={peer_addr:?}");
         let mut events = vec![];
 
         let own_addr = self
@@ -289,6 +319,7 @@ impl Node {
                 }]),
                 at: now,
             });
+            self.node_statistics.addr_announce_sent += 1;
         }
 
         let still_connected = self.out_peers.contains_key(&peer_addr)
@@ -311,6 +342,11 @@ impl Node {
         is_outbound: bool,
         now: u64,
     ) -> Vec<Event> {
+        topology_trace!(
+            now, self.node_id,
+            "{} peer={peer_addr:?}",
+            if is_outbound { "→connect" } else { "←connect" }
+        );
         let peer = Peer {
             addr: peer_addr,
             getaddr_sent: false,
@@ -341,6 +377,7 @@ impl Node {
     }
 
     pub fn on_disconnect(&mut self, peer_addr: AddressId, now: u64) {
+        topology_log!(now, self.node_id, "disconnect peer={peer_addr:?}");
         self.out_peers.remove(&peer_addr);
         self.in_peers.remove(&peer_addr);
         if let Some(entry) = self.addrman.entries.get_mut(&peer_addr) {

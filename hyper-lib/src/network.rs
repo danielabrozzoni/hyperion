@@ -52,6 +52,11 @@ impl Network {
             })
             .collect();
 
+        log::trace!(
+            target: "hyper_lib::topology",
+            "t={now} add_node id={node_id} networks={networks:?} reachable={reachable_on:?}"
+        );
+
         let node = Node {
             node_id,
             addresses: addresses.clone(),
@@ -86,6 +91,11 @@ impl Network {
                 .copied()
                 .collect()
         };
+        log::debug!(
+            target: "hyper_lib::topology",
+            "t={now} remove_node id={node_id} peers={}",
+            peers.len()
+        );
         for peer_addr in peers {
             let peer_node_id = self.node_id_for_addr(peer_addr);
             let departing_addr = self.own_addr_of(node_id, peer_addr.network);
@@ -100,6 +110,11 @@ impl Network {
     fn connect(&mut self, from_node: NodeId, to_addr: AddressId, now: u64) -> Vec<Event> {
         let from_addr = self.own_addr_of(from_node, to_addr.network);
         let to_node = self.node_id_for_addr(to_addr);
+        log::debug!(
+            target: "hyper_lib::topology",
+            "t={now} connect node={from_node} → node={to_node} (net={:?})",
+            to_addr.network
+        );
         let mut events = vec![];
         events.extend(
             self.nodes
