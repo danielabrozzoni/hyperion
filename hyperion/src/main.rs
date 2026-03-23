@@ -8,35 +8,44 @@ use simple_logger::SimpleLogger;
 
 use hyper_lib::simulator::Simulator;
 use hyperion::cli::Cli;
+use hyperion::tui;
 
 #[derive(Serialize)]
 struct DayRow {
     day: u64,
     avg_addrman_size: f64,
+    avg_addrman_live: f64,
     address_coverage: f64,
-    stale_7d: usize,
-    stale_30d: usize,
-    stale_departed: usize,
+    avg_stale_7d: f64,
+    avg_stale_30d: f64,
+    avg_departed: f64,
+    avg_departed_fresh: f64,
     fp_dual_stack_nodes: usize,
     fp_avg_overlap: f64,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let log_level = cli.log_level();
+    let level = cli.log_level();
 
     SimpleLogger::new()
         .with_level(log::LevelFilter::Warn)
-        .with_module_level("hyper_lib", log_level)
-        .with_module_level("hyperion", log_level)
+        .with_module_level("hyper_lib", level)
+        .with_module_level("hyperion", level)
         .init()
         .unwrap();
 
     let seed = cli.seed.unwrap_or_else(|| rng().next_u64());
     log::info!("RNG seed: {seed}");
 
+    let interactive = cli.interactive;
     let output_file = cli.output_file.clone();
     let config = cli.into_config();
+
+    if interactive {
+        let simulator = Simulator::new(config, seed);
+        return tui::run(simulator);
+    }
 
     log::info!("Building network and running simulation...");
     let mut simulator = Simulator::new(config, seed);
@@ -49,34 +58,21 @@ fn main() -> anyhow::Result<()> {
         .map(|i| DayRow {
             day: stats.staleness_per_day[i].day,
             avg_addrman_size: stats.avg_addrman_size[i],
+            avg_addrman_live: stats.avg_addrman_live[i],
             address_coverage: stats.address_coverage[i],
-            stale_7d: stats.staleness_per_day[i].addresses_older_than_7_days,
-            stale_30d: stats.staleness_per_day[i].addresses_older_than_30_days,
-            stale_departed: stats.staleness_per_day[i].addresses_of_departed_nodes,
+            avg_stale_7d: stats.staleness_per_day[i].avg_older_than_7_days,
+            avg_stale_30d: stats.staleness_per_day[i].avg_older_than_30_days,
+            avg_departed: stats.staleness_per_day[i].avg_departed,
+            avg_departed_fresh: stats.staleness_per_day[i].avg_departed_fresh,
             fp_dual_stack_nodes: stats.fingerprint_results[i].nodes_sampled,
             fp_avg_overlap: stats.fingerprint_results[i].avg_overlap,
         })
         .collect();
 
-    for row in &rows {
-        log::info!(
-            "Day {:>2}: addrman_avg={:.1}  coverage={:.4}  stale_7d={}  stale_30d={}  \
-             departed={}  fp_overlap={:.4}  fp_nodes={}",
-            row.day,
-            row.avg_addrman_size,
-            row.address_coverage,
-            row.stale_7d,
-            row.stale_30d,
-            row.stale_departed,
-            row.fp_avg_overlap,
-            row.fp_dual_stack_nodes,
-        );
-    }
-
     if let Some(of) = output_file {
         let mut path = PathBuf::from_str(&of)?;
         if let Some(rest) = of.strip_prefix("~/") {
-            path = home::home_dir().unwrap().join(rest);
+            path = home::home_dir().expect("$HOME is not set").join(rest);
         }
         log::info!("Writing results to {}", path.display());
         let mut wtr = csv::WriterBuilder::new()
