@@ -14,9 +14,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Terminal;
 
-use hyper_lib::address::NetworkType;
-use hyper_lib::node::{Event, NetworkMessage, NodeId};
+use hyper_lib::address::{AddressRegistry, NetworkType};
+use hyper_lib::node::{Event, GetaddrCacheAlgorithm, NetworkMessage, NodeId};
 use hyper_lib::simulator::Simulator;
+use hyper_lib::StartMode;
 
 const EVENT_LOG_CAP: usize = 500;
 const TICK_MS: u64 = 10;
@@ -80,7 +81,7 @@ impl App {
                 Event::SendMessage { .. } => EventKind::Delivery,
                 _ => EventKind::Internal,
             };
-            let desc = event_description(&event);
+            let desc = event_description(&event, &self.simulator.network.registry);
             if self.event_log.len() >= EVENT_LOG_CAP {
                 self.event_log.pop_front();
             }
@@ -142,15 +143,16 @@ impl App {
     }
 }
 
-fn fmt_addr(addr: &hyper_lib::address::AddressId) -> String {
+fn fmt_addr(addr: &hyper_lib::address::AddressId, reg: &AddressRegistry) -> String {
     let net = match addr.network {
         NetworkType::Onion => "onion",
         NetworkType::Clearnet => "clear",
     };
-    format!("{}({})", addr.id, net)
+    let node_id = reg.addresses.get(addr).map(|a| a.owner_node.to_string()).unwrap_or_else(|| "?".to_string());
+    format!("{}({})", node_id, net)
 }
 
-fn event_description(event: &Event) -> String {
+fn event_description(event: &Event, reg: &AddressRegistry) -> String {
     match event {
         // Internal events — when these fire, nothing has been delivered yet.
         Event::NodeJoin { .. } => "node join".to_string(),
@@ -158,23 +160,23 @@ fn event_description(event: &Event) -> String {
         // SelfAnnounce: node decides to announce itself → creates SendMessage(AddrAnnounce).
         // Addrman on the peer does NOT update until that SendMessage is processed.
         Event::SelfAnnounce { node_id, peer_addr, .. } => {
-            format!("sched AddrAnnounce  node={} → {}", node_id, fmt_addr(peer_addr))
+            format!("sched AddrAnnounce  node={} → {}", node_id, fmt_addr(peer_addr, reg))
         }
         // Delivery events — the `to` node's receive handler runs right now.
         Event::SendMessage { from, to, msg, .. } => match msg {
-            NetworkMessage::GetAddr => format!("GetAddr  {} → {}", fmt_addr(from), fmt_addr(to)),
+            NetworkMessage::GetAddr => format!("GetAddr  {} → {}", fmt_addr(from, reg), fmt_addr(to, reg)),
             NetworkMessage::Addr(v) if v.is_empty() => {
-                format!("getaddr-reply(0) [empty addrman]  {} → {}", fmt_addr(from), fmt_addr(to))
+                format!("getaddr-reply(0) [empty addrman]  {} → {}", fmt_addr(from, reg), fmt_addr(to, reg))
             }
             NetworkMessage::Addr(v) => {
-                format!("getaddr-reply({})  {} → {}", v.len(), fmt_addr(from), fmt_addr(to))
+                format!("getaddr-reply({})  {} → {}", v.len(), fmt_addr(from, reg), fmt_addr(to, reg))
             }
             NetworkMessage::AddrAnnounce(v) => {
                 let is_self = v.first().map_or(false, |p| p.address == *from);
                 if is_self {
-                    format!("self-announce  {} → {}", fmt_addr(from), fmt_addr(to))
+                    format!("self-announce  {} → {}", fmt_addr(from, reg), fmt_addr(to, reg))
                 } else {
-                    format!("relay-announce({})  {} → {}", v.len(), fmt_addr(from), fmt_addr(to))
+                    format!("relay-announce({})  {} → {}", v.len(), fmt_addr(from, reg), fmt_addr(to, reg))
                 }
             }
         },
@@ -195,12 +197,15 @@ fn age_str(now: u64, ts: u64) -> String {
         return "future".to_string();
     }
     let diff = now - ts;
-    if diff < 3600 {
-        format!("{}m", diff / 60)
-    } else if diff < 86400 {
-        format!("{}h", diff / 3600)
+    let days = diff / 86400;
+    let hours = (diff % 86400) / 3600;
+    let mins = (diff % 3600) / 60;
+    if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, mins)
     } else {
-        format!("{}d", diff / 86400)
+        format!("{}m", mins)
     }
 }
 
@@ -307,10 +312,11 @@ fn run_inner(
 fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
 
-    // Outer layout: top_bar | main | event_panel | help_bar
+    // Outer layout: top_bar | params_bar | main | event_panel | help_bar
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(10),
@@ -319,17 +325,18 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .split(area);
 
     draw_top_bar(f, app, outer[0]);
+    draw_params_bar(f, app, outer[1]);
 
     // Main: node list | node detail
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(30), Constraint::Min(0)])
-        .split(outer[1]);
+        .split(outer[2]);
 
     draw_node_list(f, app, main[0]);
     draw_node_detail(f, app, main[1]);
-    draw_event_panel(f, app, outer[2]);
-    draw_help_bar(f, app, outer[3]);
+    draw_event_panel(f, app, outer[3]);
+    draw_help_bar(f, app, outer[4]);
 }
 
 fn draw_top_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -349,6 +356,28 @@ fn draw_top_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .bg(Color::LightCyan)
         .add_modifier(Modifier::BOLD);
     f.render_widget(Paragraph::new(title).style(style), area);
+}
+
+fn draw_params_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let c = &app.simulator.config;
+    let algo = match c.cache_algo {
+        GetaddrCacheAlgorithm::Current => "current",
+        GetaddrCacheAlgorithm::FixedOffset => "fixed-offset",
+        GetaddrCacheAlgorithm::NetworkBased => "network-based",
+    };
+    let start = match c.start_mode {
+        StartMode::Warm => "warm",
+        StartMode::Cold => "cold",
+        StartMode::Peers => "peers",
+        StartMode::Dns => "dns",
+    };
+    let total = c.onion + c.clearnet + c.dual_stack;
+    let text = format!(
+        " algo: {}   nodes: {} (onion={} clear={} dual={})   start: {}   days: {}   churn: +{}/−{}/day ",
+        algo, total, c.onion, c.clearnet, c.dual_stack, start, c.days, c.joins_per_day, c.leaves_per_day,
+    );
+    let style = Style::default().fg(Color::DarkGray);
+    f.render_widget(Paragraph::new(text).style(style), area);
 }
 
 fn draw_node_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -487,7 +516,7 @@ fn draw_node_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 Style::default().add_modifier(Modifier::UNDERLINED),
             )));
             lines.push(Line::from(Span::styled(
-                format!("  {:<7}  {:<8}  {:<6}", "node", "network", "age"),
+                format!("  {:<7}  {:<8}  {:<8}", "node", "network", "age"),
                 Style::default().fg(Color::DarkGray),
             )));
 
@@ -508,7 +537,7 @@ fn draw_node_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 let stale = if terrible { " [stale]" } else { "" };
                 let age = age_str(now, timestamp);
                 lines.push(Line::from(format!(
-                    "  {:<7}  {:<8}  {:<6}{}",
+                    "  {:<7}  {:<8}  {:<8}{}",
                     owner, net, age, stale
                 )));
             }
@@ -572,7 +601,7 @@ fn draw_event_panel(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let next_line = match app.simulator.event_queue.peek() {
         Some(se) => {
             let rel = se.time().saturating_sub(start);
-            let desc = event_description(&se.inner);
+            let desc = event_description(&se.inner, &app.simulator.network.registry);
             let (prefix, style) = match se.inner {
                 Event::SendMessage { .. } => (
                     "→ ",

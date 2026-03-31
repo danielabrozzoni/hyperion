@@ -191,7 +191,6 @@ impl Node {
             entries.len(),
             if cache_hit { "hit" } else { "miss" }
         );
-        self.node_statistics.addr_sent += 1;
         vec![Event::SendMessage {
             from: self.own_addr_for_network(network),
             to: from,

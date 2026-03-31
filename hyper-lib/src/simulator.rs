@@ -456,6 +456,13 @@ impl Simulator {
                             .receive_getaddr(from, at, &mut self.rng)
                     }
                     NetworkMessage::Addr(addrs) => {
+                        // Count addr_sent on the sender at delivery time (mirrors getaddr_sent above).
+                        let from_node_id = self.network.registry.addresses.get(&from).map(|a| a.owner_node);
+                        if let Some(fid) = from_node_id {
+                            if let Some(n) = self.network.nodes.get_mut(&fid) {
+                                n.node_statistics.addr_sent += 1;
+                            }
+                        }
                         self.network
                             .nodes
                             .get_mut(&to_node_id)
