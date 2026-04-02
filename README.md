@@ -1,4 +1,4 @@
-# Hyperion, a Bitcoin P2P simulator
+# Hyperion - the ADDR relay fork!
 
 This is a fork of [Hyperion](https://github.com/sr-gi/hyperion), a Bitcoin P2P simulator originally built to study transaction propagation (Erlay). This fork studies address propagation instead; most of the original transaction code has been removed and replaced with address relay logic.
 
@@ -35,6 +35,8 @@ Use interactive mode to step through the simulation and inspect each node's addr
 ```
 cargo run -- -i --onion 3 --clearnet 3 --dual-stack 4
 ```
+
+![TUI screenshot](doc/tui-screenshot.png)
 
 Complete list of flags:
 
