@@ -59,6 +59,9 @@ pub struct Peer {
     pub addr: AddressId,
     pub getaddr_sent: bool,
     pub getaddr_recvd: bool,
+    /// Addresses this peer already knows; checked before relaying to them.
+    /// Reset every ~24h (in self_announce) so self-announcements always go out.
+    pub addr_known: HashSet<AddressId>,
 }
 
 /// GETADDR cache for one network type. Timestamps are frozen at build time.
@@ -96,6 +99,8 @@ pub enum Event {
     NodeJoin { at: u64 },
     NodeLeave { node_id: NodeId, at: u64 },
     SelfAnnounce { node_id: NodeId, peer_addr: AddressId, at: u64 },
+    /// An outbound peer disconnected; the node should find a replacement on that network.
+    NodeReconnect { node_id: NodeId, network: NetworkType, at: u64 },
 }
 
 impl Node {
@@ -228,6 +233,14 @@ impl Node {
                 .add(payload.address, payload.timestamp, penalty, now);
         }
 
+        // Mark the sender as knowing all addresses they just sent us.
+        // Mirrors Bitcoin Core's AddAddressKnown() called in ProcessAddrs.
+        if let Some(peer) = self.out_peers.get_mut(&from).or_else(|| self.in_peers.get_mut(&from)) {
+            for payload in &addrs {
+                peer.addr_known.insert(payload.address);
+            }
+        }
+
         if batch_size > 10 {
             return events;
         }
@@ -250,6 +263,14 @@ impl Node {
             let n_relay = self.relay_count(payload.address, registry, rng);
             let targets = self.select_relay_peers(from, n_relay, rng);
             for target in targets {
+                // Skip peers that already know this address; insert before sending.
+                // Mirrors Bitcoin Core's addr_already_known check in SendMessages.
+                if self.out_peers.get(&target).map_or(false, |p| p.addr_known.contains(&payload.address)) {
+                    continue;
+                }
+                if let Some(peer) = self.out_peers.get_mut(&target) {
+                    peer.addr_known.insert(payload.address);
+                }
                 protocol_trace!(now, self.node_id, "  relay addr={:?} → peer={target:?}", payload.address);
                 events.push(Event::SendMessage {
                     from: self.own_addr_for_network(target.network),
@@ -299,6 +320,13 @@ impl Node {
     ) -> Vec<Event> {
         protocol_log!(now, self.node_id, "SelfAnnounce to={peer_addr:?}");
         let mut events = vec![];
+
+        // Reset addr_known for this peer before self-announcing so the announcement
+        // always goes out even if the peer's filter has seen our address before.
+        // Mirrors Bitcoin Core's m_addr_known->reset() in SendMessages (net_processing.cpp).
+        if let Some(peer) = self.out_peers.get_mut(&peer_addr).or_else(|| self.in_peers.get_mut(&peer_addr)) {
+            peer.addr_known.clear();
+        }
 
         let own_addr = self
             .addresses
@@ -350,6 +378,7 @@ impl Node {
             addr: peer_addr,
             getaddr_sent: false,
             getaddr_recvd: false,
+            addr_known: HashSet::new(),
         };
         let mut events = vec![];
 
@@ -375,12 +404,21 @@ impl Node {
         events
     }
 
-    pub fn on_disconnect(&mut self, peer_addr: AddressId, now: u64) {
+    pub fn on_disconnect(&mut self, peer_addr: AddressId, now: u64) -> Vec<Event> {
         topology_log!(now, self.node_id, "disconnect peer={peer_addr:?}");
-        self.out_peers.remove(&peer_addr);
+        let was_outbound = self.out_peers.remove(&peer_addr).is_some();
         self.in_peers.remove(&peer_addr);
         if let Some(entry) = self.addrman.entries.get_mut(&peer_addr) {
             entry.record_connected(now);
+        }
+        if was_outbound {
+            vec![Event::NodeReconnect {
+                node_id: self.node_id,
+                network: peer_addr.network,
+                at: now,
+            }]
+        } else {
+            vec![]
         }
     }
 

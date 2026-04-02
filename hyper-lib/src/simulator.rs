@@ -8,7 +8,7 @@ use rand::{Rng, SeedableRng};
 use crate::address::NetworkType;
 use crate::fingerprint::FingerprintAnalyzer;
 use crate::network::Network;
-use crate::node::{Event, NetworkMessage};
+use crate::node::{Event, NetworkMessage, NodeId};
 use crate::statistics::{ChurnStats, SimulationStatistics, StaleAddressStats};
 use crate::SimulationConfig;
 
@@ -63,6 +63,10 @@ pub struct Simulator {
     day_joined: [usize; 3],
     /// Nodes that left this day by type: [onion, clearnet, dual].
     day_left: [usize; 3],
+    /// Initial nodes — present from day 0, never selected for NodeLeave.
+    pub permanent_nodes: HashSet<NodeId>,
+    /// Next day index for which churn has not yet been scheduled (used by step()).
+    next_churn_day: u64,
 }
 
 impl Simulator {
@@ -87,8 +91,11 @@ impl Simulator {
             start_time,
             day_joined: [0; 3],
             day_left: [0; 3],
+            permanent_nodes: HashSet::new(),
+            next_churn_day: 0,
         };
         sim.build_initial_network();
+        sim.permanent_nodes = sim.network.nodes.keys().copied().collect();
         sim
     }
 
@@ -189,6 +196,24 @@ impl Simulator {
             self.network.registry.addresses.len(),
             self.event_queue.len()
         );
+
+        // Second pass: nodes added early had fewer peers available than the target outbound
+        // count. Top them up now that the full network exists.
+        let node_ids: Vec<_> = self.network.nodes.keys().copied().collect();
+        let mut nodes_topped = 0usize;
+        for node_id in node_ids {
+            let before = self.network.nodes[&node_id].out_peers.len();
+            let events = self.network.top_up_outbounds(node_id, outbounds, now, &mut self.rng);
+            if self.network.nodes[&node_id].out_peers.len() > before {
+                nodes_topped += 1;
+            }
+            for e in events {
+                self.add_event(e);
+            }
+        }
+        if nodes_topped > 0 {
+            log::debug!("Second pass: topped up outbound slots on {} nodes", nodes_topped);
+        }
 
         match start_mode {
             crate::StartMode::Warm => {
@@ -303,6 +328,7 @@ impl Simulator {
             self.day_joined = [0; 3];
             self.day_left = [0; 3];
             self.schedule_churn(day);
+            self.next_churn_day = day + 1;
             self.run_until(self.start_time + day * 86400 + 86399);
 
             if day >= burn_in {
@@ -344,7 +370,14 @@ impl Simulator {
             self.add_event(Event::NodeJoin { at });
         }
         for _ in 0..leaves {
-            if let Some(&node_id) = self.network.nodes.keys().choose(&mut self.rng) {
+            let candidate = self
+                .network
+                .nodes
+                .keys()
+                .filter(|id| !self.permanent_nodes.contains(*id))
+                .choose(&mut self.rng)
+                .copied();
+            if let Some(node_id) = candidate {
                 let at = day_start + self.rng.random_range(0..86400u64);
                 self.add_event(Event::NodeLeave { node_id, at });
             }
@@ -428,6 +461,13 @@ impl Simulator {
                         .get_mut(&node_id)
                         .unwrap()
                         .self_announce(peer_addr, at, &mut self.rng)
+                } else {
+                    vec![]
+                }
+            }
+            Event::NodeReconnect { node_id, network, at } => {
+                if self.network.nodes.contains_key(&node_id) {
+                    self.network.reconnect_outbound(node_id, network, at, &mut self.rng)
                 } else {
                     vec![]
                 }
@@ -569,7 +609,22 @@ impl Simulator {
     }
 
     /// Process one event from the queue. Returns (event, timestamp) or None if queue is empty.
+    /// Also schedules churn for any day that has started but not yet had churn scheduled,
+    /// so that NodeJoin/NodeLeave events appear in interactive (TUI) mode.
     pub fn step(&mut self) -> Option<(Event, u64)> {
+        let total_days = self.config.burn_in_days + self.config.days;
+        if let Some(se) = self.event_queue.peek() {
+            let at = se.time();
+            while self.next_churn_day < total_days {
+                let day_start = self.start_time + self.next_churn_day * 86400;
+                if at >= day_start {
+                    self.schedule_churn(self.next_churn_day);
+                    self.next_churn_day += 1;
+                } else {
+                    break;
+                }
+            }
+        }
         let se = self.event_queue.pop()?;
         let at = se.time();
         let event = se.inner.clone();
@@ -608,6 +663,9 @@ fn log_event(event: &Event) {
         Event::SelfAnnounce { node_id, peer_addr, at } => {
             log::trace!(target: "hyper_lib::event", "t={at} SelfAnnounce node={node_id} peer={peer_addr:?}");
         }
+        Event::NodeReconnect { node_id, network, at } => {
+            log::trace!(target: "hyper_lib::event", "t={at} NodeReconnect node={node_id} net={network:?}");
+        }
         Event::SendMessage { from, to, msg, at } => {
             let kind = match msg {
                 NetworkMessage::GetAddr => "GetAddr",
@@ -625,5 +683,6 @@ fn event_time(event: &Event) -> u64 {
         Event::NodeJoin { at, .. } => *at,
         Event::NodeLeave { at, .. } => *at,
         Event::SelfAnnounce { at, .. } => *at,
+        Event::NodeReconnect { at, .. } => *at,
     }
 }

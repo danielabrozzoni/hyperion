@@ -81,6 +81,7 @@ impl Network {
     }
 
     /// Remove a node: notify its peers of the disconnect and mark its addresses inactive.
+    /// Returns NodeReconnect events for any peer that lost an outbound connection.
     pub fn remove_node(&mut self, node_id: NodeId, now: u64) -> Vec<Event> {
         self.registry.deactivate_node(node_id);
         let peers: Vec<AddressId> = {
@@ -96,15 +97,58 @@ impl Network {
             "t={now} remove_node id={node_id} peers={}",
             peers.len()
         );
+        let mut events = vec![];
         for peer_addr in peers {
             let peer_node_id = self.node_id_for_addr(peer_addr);
             let departing_addr = self.own_addr_of(node_id, peer_addr.network);
             if let Some(peer_node) = self.nodes.get_mut(&peer_node_id) {
-                peer_node.on_disconnect(departing_addr, now);
+                events.extend(peer_node.on_disconnect(departing_addr, now));
             }
         }
         self.nodes.remove(&node_id);
-        vec![]
+        events
+    }
+
+    /// Find a new outbound peer for `node_id` on `network` and connect to it.
+    /// Excludes nodes the caller is already connected to (inbound or outbound).
+    pub fn reconnect_outbound(
+        &mut self,
+        node_id: NodeId,
+        network: NetworkType,
+        now: u64,
+        rng: &mut impl Rng,
+    ) -> Vec<Event> {
+        let already_connected: HashSet<AddressId> = {
+            let node = &self.nodes[&node_id];
+            node.out_peers.keys().chain(node.in_peers.keys()).copied().collect()
+        };
+        let candidate = self
+            .registry
+            .addresses
+            .values()
+            .filter(|addr| {
+                addr.is_reachable
+                    && addr.owner_node != node_id
+                    && addr.is_active
+                    && addr.id.network == network
+                    && !already_connected.contains(&addr.id)
+            })
+            .map(|addr| addr.id)
+            .choose(rng);
+
+        if let Some(peer_addr) = candidate {
+            log::debug!(
+                target: "hyper_lib::topology",
+                "t={now} reconnect_outbound node={node_id} net={network:?} → {peer_addr:?}"
+            );
+            self.connect(node_id, peer_addr, now)
+        } else {
+            log::debug!(
+                target: "hyper_lib::topology",
+                "t={now} reconnect_outbound node={node_id} net={network:?} — no candidate found"
+            );
+            vec![]
+        }
     }
 
     fn connect(&mut self, from_node: NodeId, to_addr: AddressId, now: u64) -> Vec<Event> {
@@ -128,6 +172,46 @@ impl Network {
                 .unwrap()
                 .on_connect(from_addr, false, now),
         );
+        events
+    }
+
+    /// Top up a node's outbound connections to `target` if it currently has fewer.
+    /// Safe to call after the network is built; excludes already-connected peers.
+    pub fn top_up_outbounds(
+        &mut self,
+        node_id: NodeId,
+        target: usize,
+        now: u64,
+        rng: &mut impl Rng,
+    ) -> Vec<Event> {
+        let current = self.nodes[&node_id].out_peers.len();
+        let needed = target.saturating_sub(current);
+        if needed == 0 {
+            return vec![];
+        }
+        let already_connected: HashSet<AddressId> = {
+            let node = &self.nodes[&node_id];
+            node.out_peers.keys().chain(node.in_peers.keys()).copied().collect()
+        };
+        let own_networks: HashSet<NetworkType> =
+            self.nodes[&node_id].addresses.iter().map(|a| a.network).collect();
+        let candidates: Vec<AddressId> = self
+            .registry
+            .addresses
+            .values()
+            .filter(|addr| {
+                addr.is_reachable
+                    && addr.owner_node != node_id
+                    && addr.is_active
+                    && own_networks.contains(&addr.id.network)
+                    && !already_connected.contains(&addr.id)
+            })
+            .map(|addr| addr.id)
+            .choose_multiple(rng, needed);
+        let mut events = vec![];
+        for peer_addr in candidates {
+            events.extend(self.connect(node_id, peer_addr, now));
+        }
         events
     }
 
