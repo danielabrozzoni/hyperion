@@ -173,7 +173,7 @@ The three algorithms differ only in what timestamp is written into the cache at 
 |----------|--------|-----------|
 | Time unit | Seconds | Natural for Bitcoin timestamps; day-scale simulation needs no sub-second precision |
 | Network latency | Not simulated | Irrelevant at day-scale |
-| Initial addrman state | `--warm-start` (pre-populated, default) or `--cold-start` (empty) | Cold start is realistic but needs warm-up time; warm start tests algorithms faster |
+| Initial addrman state | `--start dns` (default), `warm`, `cold`, `peers` | `dns`: each node gets a random sample of addresses at timestamps `now − rand(3..7 days)`, mirroring Bitcoin Core's `ThreadDNSAddressSeed` (`net.cpp:2378`). Sample floor is 6 entries per node so that 23% GETADDR selection always returns at least 1 result. `warm`: all addresses at `now`. `peers`: connected peers only at `now`. `cold`: empty (30-day burn-in applied by default). |
 | Connection model | Success if node active, failure if departed | Graceful vs timeout doesn't affect our metrics |
 | Node departure | Mark address inactive in registry; addrmans age out naturally via `IsTerrible()` | No need to model disconnect mechanics |
 

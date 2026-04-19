@@ -1,5 +1,7 @@
 # Address Relay Simulator — Implementation Plan
 
+> **Status: COMPLETE.** All steps (0–10) have been implemented. This document is kept as a reference for design decisions and data structure rationale.
+
 See `ADDRESS_RELAY_SPEC.md` for the goals, Bitcoin Core behavior reference, and design rationale. This document specifies exactly what to build.
 
 ---
