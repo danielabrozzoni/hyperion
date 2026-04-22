@@ -17,7 +17,7 @@ pub enum StartMode {
     /// Every node's addrman starts with only its directly connected peers' addresses.
     Peers,
     /// Every node's addrman starts with a random sample of the network, with timestamps
-    /// 3–7 days old, mirroring what Bitcoin Core nodes receive from DNS seeds at bootstrap.
+    /// uniformly random in [3, 7) days old (second precision), mirroring Bitcoin Core's DNS seed bootstrap.
     Dns,
 }
 

@@ -56,11 +56,11 @@ pub struct Cli {
     pub dual_stack: usize,
 
     /// Percentage of clearnet addresses accepting inbound connections
-    #[clap(long, default_value_t = 15)]
+    #[clap(long, default_value_t = 100)]
     pub reachable_clearnet_pct: u8,
 
     /// Percentage of onion addresses accepting inbound connections
-    #[clap(long, default_value_t = 50)]
+    #[clap(long, default_value_t = 100)]
     pub reachable_onion_pct: u8,
 
     /// Outbound connections per node
@@ -79,8 +79,8 @@ pub struct Cli {
     #[clap(long, default_value_t = 100)]
     pub leaves_per_day: usize,
 
-    /// Addrman initialisation: warm (all addresses), cold (empty), peers (connected peers only)
-    #[clap(long, default_value = "warm")]
+    /// Addrman initialisation: dns (random sample, 3–7 day old timestamps), warm (all addresses), cold (empty), peers (connected peers only)
+    #[clap(long, default_value = "dns")]
     pub start: CliStartMode,
 
     /// Days to skip before recording statistics (default: 30 for cold, 0 otherwise)
