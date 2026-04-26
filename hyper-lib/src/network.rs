@@ -109,48 +109,6 @@ impl Network {
         events
     }
 
-    /// Find a new outbound peer for `node_id` on `network` and connect to it.
-    /// Excludes nodes the caller is already connected to (inbound or outbound).
-    pub fn reconnect_outbound(
-        &mut self,
-        node_id: NodeId,
-        network: NetworkType,
-        now: u64,
-        rng: &mut impl Rng,
-    ) -> Vec<Event> {
-        let already_connected: HashSet<AddressId> = {
-            let node = &self.nodes[&node_id];
-            node.out_peers.keys().chain(node.in_peers.keys()).copied().collect()
-        };
-        let candidate = self
-            .registry
-            .addresses
-            .values()
-            .filter(|addr| {
-                addr.is_reachable
-                    && addr.owner_node != node_id
-                    && addr.is_active
-                    && addr.id.network == network
-                    && !already_connected.contains(&addr.id)
-            })
-            .map(|addr| addr.id)
-            .choose(rng);
-
-        if let Some(peer_addr) = candidate {
-            log::debug!(
-                target: "hyper_lib::topology",
-                "t={now} reconnect_outbound node={node_id} net={network:?} → {peer_addr:?}"
-            );
-            self.connect(node_id, peer_addr, now)
-        } else {
-            log::debug!(
-                target: "hyper_lib::topology",
-                "t={now} reconnect_outbound node={node_id} net={network:?} — no candidate found"
-            );
-            vec![]
-        }
-    }
-
     fn connect(&mut self, from_node: NodeId, to_addr: AddressId, now: u64) -> Vec<Event> {
         let from_addr = self.own_addr_of(from_node, to_addr.network);
         let to_node = self.node_id_for_addr(to_addr);

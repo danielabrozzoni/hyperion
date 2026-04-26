@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rand::seq::IteratorRandom;
 use rand::Rng;
-use rand_distr::{Distribution, Exp};
 
 use crate::address::{AddressId, AddressRegistry, NetworkType};
 use crate::addrman::{Addrman, AddrmanEntry};
@@ -36,9 +35,13 @@ macro_rules! topology_trace {
 
 const GETADDR_CACHE_LIFETIME_BASE: u64 = 21 * 3600;
 const GETADDR_CACHE_LIFETIME_RAND: u64 = 6 * 3600;
-const SELF_ANNOUNCE_DELAY: u64 = 30;
 const DAYS: u64 = 86400;
 const HOURS: u64 = 3600;
+/// Per-hop relay delay (seconds). Models Bitcoin Core's ~30 s addr-send batching window.
+/// With the 10-minute freshness filter this caps relay chains at ~20 hops, matching
+/// real-network behaviour where an addr reaches the whole network or dies within
+/// 10 minutes of its timestamp.
+const RELAY_HOP_DELAY: u64 = 30;
 
 pub struct Node {
     pub node_id: NodeId,
@@ -60,7 +63,7 @@ pub struct Peer {
     pub getaddr_sent: bool,
     pub getaddr_recvd: bool,
     /// Addresses this peer already knows; checked before relaying to them.
-    /// Reset every ~24h (in self_announce) so self-announcements always go out.
+    /// Reset daily (in self_announce) so self-announcements always go out.
     pub addr_known: HashSet<AddressId>,
 }
 
@@ -98,7 +101,6 @@ pub enum Event {
     SendMessage { from: AddressId, to: AddressId, msg: NetworkMessage, at: u64 },
     NodeJoin { at: u64 },
     NodeLeave { node_id: NodeId, at: u64 },
-    SelfAnnounce { node_id: NodeId, peer_addr: AddressId, at: u64 },
     /// An outbound peer disconnected; the node should find a replacement on that network.
     NodeReconnect { node_id: NodeId, network: NetworkType, at: u64 },
 }
@@ -276,7 +278,7 @@ impl Node {
                     from: self.own_addr_for_network(target.network),
                     to: target,
                     msg: NetworkMessage::AddrAnnounce(vec![payload.clone()]),
-                    at: now,
+                    at: now + RELAY_HOP_DELAY,
                 });
             }
         }
@@ -312,52 +314,38 @@ impl Node {
             .choose_multiple(rng, n)
     }
 
-    pub fn self_announce(
-        &mut self,
-        peer_addr: AddressId,
-        now: u64,
-        rng: &mut impl Rng,
-    ) -> Vec<Event> {
-        protocol_log!(now, self.node_id, "SelfAnnounce to={peer_addr:?}");
+    /// Send our own address to every connected peer once (called daily by the simulator).
+    pub fn self_announce(&mut self, now: u64) -> Vec<Event> {
+        protocol_log!(now, self.node_id, "DailySelfAnnounce");
         let mut events = vec![];
 
-        // Reset addr_known for this peer before self-announcing so the announcement
-        // always goes out even if the peer's filter has seen our address before.
-        // Mirrors Bitcoin Core's m_addr_known->reset() in SendMessages (net_processing.cpp).
-        if let Some(peer) = self.out_peers.get_mut(&peer_addr).or_else(|| self.in_peers.get_mut(&peer_addr)) {
-            peer.addr_known.clear();
-        }
+        let peer_addrs: Vec<AddressId> = self.out_peers.keys().chain(self.in_peers.keys()).copied().collect();
+        for peer_addr in peer_addrs {
+            // Reset addr_known so the announcement always goes out even if the peer's
+            // filter has seen our address before. Mirrors Bitcoin Core's m_addr_known->reset()
+            // in SendMessages (net_processing.cpp).
+            if let Some(peer) = self.out_peers.get_mut(&peer_addr).or_else(|| self.in_peers.get_mut(&peer_addr)) {
+                peer.addr_known.clear();
+            }
 
-        let own_addr = self
-            .addresses
-            .iter()
-            .find(|a| {
-                a.network == peer_addr.network && self.reachable_networks.contains(&a.network)
-            })
-            .copied();
+            let own_addr = self
+                .addresses
+                .iter()
+                .find(|a| a.network == peer_addr.network && self.reachable_networks.contains(&a.network))
+                .copied();
 
-        if let Some(addr) = own_addr {
-            events.push(Event::SendMessage {
-                from: addr,
-                to: peer_addr,
-                msg: NetworkMessage::AddrAnnounce(vec![AddrPayload {
-                    address: addr,
-                    timestamp: now,
-                }]),
-                at: now,
-            });
-            self.node_statistics.addr_announce_sent += 1;
-        }
-
-        let still_connected = self.out_peers.contains_key(&peer_addr)
-            || self.in_peers.contains_key(&peer_addr);
-        if still_connected {
-            let next = now + sample_exponential(rng, 24 * HOURS);
-            events.push(Event::SelfAnnounce {
-                node_id: self.node_id,
-                peer_addr,
-                at: next,
-            });
+            if let Some(addr) = own_addr {
+                events.push(Event::SendMessage {
+                    from: addr,
+                    to: peer_addr,
+                    msg: NetworkMessage::AddrAnnounce(vec![AddrPayload {
+                        address: addr,
+                        timestamp: now,
+                    }]),
+                    at: now,
+                });
+                self.node_statistics.addr_announce_sent += 1;
+            }
         }
 
         events
@@ -395,12 +383,6 @@ impl Node {
             self.in_peers.insert(peer_addr, peer);
         }
 
-        events.push(Event::SelfAnnounce {
-            node_id: self.node_id,
-            peer_addr,
-            at: now + SELF_ANNOUNCE_DELAY,
-        });
-
         events
     }
 
@@ -425,7 +407,3 @@ impl Node {
     pub fn on_connect_failed(&mut self, _peer_addr: AddressId, _now: u64) {}
 }
 
-fn sample_exponential(rng: &mut impl Rng, mean: u64) -> u64 {
-    let exp = Exp::new(1.0 / mean as f64).unwrap();
-    exp.sample(rng) as u64
-}

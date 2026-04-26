@@ -131,17 +131,7 @@ impl Simulator {
             } else {
                 HashSet::new()
             };
-            let (_, events) = self.network.add_node(
-                vec![NetworkType::Onion],
-                reachable_on,
-                outbounds,
-                algo,
-                now,
-                &mut self.rng,
-            );
-            for e in events {
-                self.add_event(e);
-            }
+            self.network.add_node(vec![NetworkType::Onion], reachable_on, 0, algo, now, &mut self.rng);
         }
         log::debug!("Added {} onion-only nodes ({} reachable)", onion, onion_reachable);
 
@@ -151,17 +141,7 @@ impl Simulator {
             } else {
                 HashSet::new()
             };
-            let (_, events) = self.network.add_node(
-                vec![NetworkType::Clearnet],
-                reachable_on,
-                outbounds,
-                algo,
-                now,
-                &mut self.rng,
-            );
-            for e in events {
-                self.add_event(e);
-            }
+            self.network.add_node(vec![NetworkType::Clearnet], reachable_on, 0, algo, now, &mut self.rng);
         }
         log::debug!("Added {} clearnet-only nodes ({} reachable)", clearnet, clearnet_reachable);
 
@@ -173,22 +153,20 @@ impl Simulator {
             if i < dual_clearnet_reachable {
                 reachable_on.insert(NetworkType::Clearnet);
             }
-            let (_, events) = self.network.add_node(
-                vec![NetworkType::Onion, NetworkType::Clearnet],
-                reachable_on,
-                outbounds,
-                algo,
-                now,
-                &mut self.rng,
-            );
-            for e in events {
-                self.add_event(e);
-            }
+            self.network.add_node(vec![NetworkType::Onion, NetworkType::Clearnet], reachable_on, 0, algo, now, &mut self.rng);
         }
         log::debug!(
             "Added {} dual-stack nodes ({} onion-reachable, {} clearnet-reachable)",
             dual_stack, dual_onion_reachable, dual_clearnet_reachable
         );
+
+        let node_ids: Vec<_> = self.network.nodes.keys().copied().collect();
+        for node_id in node_ids {
+            let events = self.network.top_up_outbounds(node_id, outbounds, now, &mut self.rng);
+            for e in events {
+                self.add_event(e);
+            }
+        }
         log::info!(
             "Network topology built in {:.2?}: {} nodes, {} addresses, {} queued events",
             t_build.elapsed(),
@@ -196,24 +174,6 @@ impl Simulator {
             self.network.registry.addresses.len(),
             self.event_queue.len()
         );
-
-        // Second pass: nodes added early had fewer peers available than the target outbound
-        // count. Top them up now that the full network exists.
-        let node_ids: Vec<_> = self.network.nodes.keys().copied().collect();
-        let mut nodes_topped = 0usize;
-        for node_id in node_ids {
-            let before = self.network.nodes[&node_id].out_peers.len();
-            let events = self.network.top_up_outbounds(node_id, outbounds, now, &mut self.rng);
-            if self.network.nodes[&node_id].out_peers.len() > before {
-                nodes_topped += 1;
-            }
-            for e in events {
-                self.add_event(e);
-            }
-        }
-        if nodes_topped > 0 {
-            log::debug!("Second pass: topped up outbound slots on {} nodes", nodes_topped);
-        }
 
         match start_mode {
             crate::StartMode::Warm => {
@@ -364,8 +324,13 @@ impl Simulator {
     }
 
     fn do_daily_self_announce(&mut self, now: u64) {
+        let target = self.config.outbounds;
         let node_ids: Vec<_> = self.network.nodes.keys().copied().collect();
         for node_id in node_ids {
+            let top_up_events = self.network.top_up_outbounds(node_id, target, now, &mut self.rng);
+            for e in top_up_events {
+                self.add_event(e);
+            }
             let events = self.network.nodes.get_mut(&node_id).unwrap().self_announce(now);
             for e in events {
                 self.add_event(e);
@@ -445,7 +410,7 @@ impl Simulator {
                     (vec![NetworkType::Clearnet], HashSet::new())
                 };
                 let idx = node_type_idx(&networks);
-                let (_, events) = self.network.add_node(
+                let (node_id, mut events) = self.network.add_node(
                     networks,
                     reachable_on,
                     outbounds,
@@ -453,6 +418,7 @@ impl Simulator {
                     at,
                     &mut self.rng,
                 );
+                events.extend(self.network.nodes.get_mut(&node_id).unwrap().self_announce(at));
                 self.day_joined[idx] += 1;
                 events
             }
@@ -465,9 +431,9 @@ impl Simulator {
                     vec![]
                 }
             }
-            Event::NodeReconnect { node_id, network, at } => {
+            Event::NodeReconnect { node_id, at, .. } => {
                 if self.network.nodes.contains_key(&node_id) {
-                    self.network.reconnect_outbound(node_id, network, at, &mut self.rng)
+                    self.network.top_up_outbounds(node_id, self.config.outbounds, at, &mut self.rng)
                 } else {
                     vec![]
                 }

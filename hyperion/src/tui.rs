@@ -29,7 +29,7 @@ const DEPARTED_DISPLAY_SECS: u64 = 5;
 /// Whether an event is an internal scheduling step or an actual network delivery.
 #[derive(Clone, Copy, PartialEq)]
 enum EventKind {
-    /// Internal bookkeeping: NodeJoin, NodeLeave, SelfAnnounce.
+    /// Internal bookkeeping: NodeJoin, NodeLeave.
     Internal,
     /// A message arrives at a node and its receive handler runs (addrman may change).
     Delivery,
@@ -245,9 +245,6 @@ fn event_description(event: &Event, reg: &AddressRegistry) -> String {
                 NetworkType::Clearnet => "clear",
             };
             format!("reconnect  node={} net={}", node_id, net)
-        }
-        Event::SelfAnnounce { node_id, peer_addr, .. } => {
-            format!("announce-timer  node={} → {}", node_id, fmt_addr(peer_addr, reg))
         }
         Event::SendMessage { from, to, msg, .. } => match msg {
             NetworkMessage::GetAddr => format!("GetAddr  {} → {}", fmt_addr(from, reg), fmt_addr(to, reg)),
@@ -516,9 +513,19 @@ fn draw_top_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
         "—".to_string()
     };
     let queue_depth = app.simulator.event_queue.len();
+    let phase = if app.simulator.is_done() {
+        "DONE".to_string()
+    } else {
+        let (is_burn_in, day, total) = app.simulator.day_progress();
+        if is_burn_in {
+            format!("burn-in {}/{}", day, total)
+        } else {
+            format!("day {}/{}", day, total)
+        }
+    };
     let title = format!(
-        " HYPERION   Time: {}   Events: {}   Logged: {} ",
-        sim_time, queue_depth, app.event_log.len()
+        " HYPERION   Time: {}   {}   Events: {}   Logged: {} ",
+        sim_time, phase, queue_depth, app.event_log.len()
     );
     let style = Style::default()
         .fg(Color::Black)
