@@ -265,7 +265,7 @@ impl Simulator {
             }
             crate::StartMode::Dns => {
                 // Mirrors Bitcoin Core's ThreadDNSAddressSeed: each node receives a random
-                // sample of the network with timestamps 3–7 days old (nTime = now - rand(3..=7) days).
+                // sample of the network with timestamps uniformly random in [3, 7) days old (second precision).
                 let pct = self.config.dns_sample_pct as usize;
                 let all_addrs: Vec<_> = self
                     .network
@@ -274,9 +274,10 @@ impl Simulator {
                     .values()
                     .map(|a| a.id)
                     .collect();
-                let sample_size = ((all_addrs.len() * pct) / 100).max(1);
+                // Minimum 6: 23% of fewer than 5 entries rounds to 0, producing empty GETADDR replies.
+                let sample_size = ((all_addrs.len() * pct) / 100).max(6);
                 log::info!(
-                    "DNS-start: seeding each addrman with ~{} addresses (~{}% of {}) at 3–7 day old timestamps...",
+                    "DNS-start: seeding each addrman with ~{} addresses (~{}% of {}) at uniformly random [3,7)-day-old timestamps...",
                     sample_size, pct, all_addrs.len()
                 );
                 let node_ids: Vec<_> = self.network.nodes.keys().copied().collect();
@@ -287,9 +288,9 @@ impl Simulator {
                     sample.truncate(sample_size);
                     let node = self.network.nodes.get_mut(&node_id).unwrap();
                     for addr in sample {
-                        // Bitcoin Core assigns timestamps now - rand(3..=7) days for DNS seed entries.
-                        let age_days = self.rng.random_range(3u64..=7);
-                        let ts = now.saturating_sub(age_days * 86400);
+                        // Bitcoin Core assigns timestamps now - rand_uniform in [3, 7) days (second precision).
+                        let age_secs = self.rng.random_range(3 * 86400u64..7 * 86400);
+                        let ts = now.saturating_sub(age_secs);
                         node.addrman.add(addr, ts, 0, now);
                     }
                 }
@@ -327,9 +328,11 @@ impl Simulator {
 
             self.day_joined = [0; 3];
             self.day_left = [0; 3];
+            let day_start = self.start_time + day * 86400;
+            self.do_daily_self_announce(day_start);
             self.schedule_churn(day);
             self.next_churn_day = day + 1;
-            self.run_until(self.start_time + day * 86400 + 86399);
+            self.run_until(day_start + 86399);
 
             if day >= burn_in {
                 let sim_day = day - burn_in;
@@ -360,6 +363,16 @@ impl Simulator {
         }
     }
 
+    fn do_daily_self_announce(&mut self, now: u64) {
+        let node_ids: Vec<_> = self.network.nodes.keys().copied().collect();
+        for node_id in node_ids {
+            let events = self.network.nodes.get_mut(&node_id).unwrap().self_announce(now);
+            for e in events {
+                self.add_event(e);
+            }
+        }
+    }
+
     fn schedule_churn(&mut self, day: u64) {
         let day_start = self.start_time + day * 86400;
         let joins = self.config.joins_per_day;
@@ -369,15 +382,17 @@ impl Simulator {
             let at = day_start + self.rng.random_range(0..86400u64);
             self.add_event(Event::NodeJoin { at });
         }
+        let mut already_leaving: HashSet<NodeId> = HashSet::new();
         for _ in 0..leaves {
             let candidate = self
                 .network
                 .nodes
                 .keys()
-                .filter(|id| !self.permanent_nodes.contains(*id))
+                .filter(|id| !self.permanent_nodes.contains(*id) && !already_leaving.contains(*id))
                 .choose(&mut self.rng)
                 .copied();
             if let Some(node_id) = candidate {
+                already_leaving.insert(node_id);
                 let at = day_start + self.rng.random_range(0..86400u64);
                 self.add_event(Event::NodeLeave { node_id, at });
             }
@@ -450,21 +465,6 @@ impl Simulator {
                     vec![]
                 }
             }
-            Event::SelfAnnounce {
-                node_id,
-                peer_addr,
-                at,
-            } => {
-                if self.network.nodes.contains_key(&node_id) {
-                    self.network
-                        .nodes
-                        .get_mut(&node_id)
-                        .unwrap()
-                        .self_announce(peer_addr, at, &mut self.rng)
-                } else {
-                    vec![]
-                }
-            }
             Event::NodeReconnect { node_id, network, at } => {
                 if self.network.nodes.contains_key(&node_id) {
                     self.network.reconnect_outbound(node_id, network, at, &mut self.rng)
@@ -524,7 +524,7 @@ impl Simulator {
     }
 
     fn collect_statistics(&mut self, day: u64) {
-        let now = self.start_time + day * 86400 + 86399;
+        let now = self.start_time + (self.config.burn_in_days + day) * 86400 + 86399;
         let mut analyzer = FingerprintAnalyzer::new();
         let mut total_addrman = 0usize;
         let mut total_addrman_live = 0usize;
@@ -609,21 +609,47 @@ impl Simulator {
     }
 
     /// Process one event from the queue. Returns (event, timestamp) or None if queue is empty.
-    /// Also schedules churn for any day that has started but not yet had churn scheduled,
-    /// so that NodeJoin/NodeLeave events appear in interactive (TUI) mode.
+    /// Process one event from the queue. Returns (event, timestamp) or None if queue is empty
+    /// and all days have been scheduled. Also keeps statistics in sync with `run()`: resets
+    /// the per-day churn counters and calls `collect_statistics` at every day boundary.
     pub fn step(&mut self) -> Option<(Event, u64)> {
         let total_days = self.config.burn_in_days + self.config.days;
-        if let Some(se) = self.event_queue.peek() {
-            let at = se.time();
-            while self.next_churn_day < total_days {
-                let day_start = self.start_time + self.next_churn_day * 86400;
-                if at >= day_start {
-                    self.schedule_churn(self.next_churn_day);
-                    self.next_churn_day += 1;
-                } else {
-                    break;
+        // When the queue is empty between days, fall back to the next day's start time so
+        // that the scheduling loop below still fires and repopulates the queue.
+        let at = self.event_queue.peek().map(|se| se.time())
+            .unwrap_or_else(|| self.start_time + self.next_churn_day * 86400);
+        while self.next_churn_day < total_days {
+            let day_start = self.start_time + self.next_churn_day * 86400;
+            if at >= day_start {
+                // All events for the just-completed day (next_churn_day - 1) have now been
+                // processed (the queue is time-ordered). Collect its stats then reset the
+                // per-day churn counters before scheduling the new day.
+                if self.next_churn_day > 0 {
+                    let completed = self.next_churn_day - 1;
+                    if completed >= self.config.burn_in_days {
+                        let sim_day = completed - self.config.burn_in_days;
+                        self.collect_statistics(sim_day);
+                    }
+                    self.day_joined = [0; 3];
+                    self.day_left = [0; 3];
+                }
+                self.do_daily_self_announce(day_start);
+                self.schedule_churn(self.next_churn_day);
+                self.next_churn_day += 1;
+            } else {
+                break;
+            }
+        }
+        // If all days are scheduled and the queue just drained, collect stats for the final day.
+        if self.next_churn_day >= total_days && self.event_queue.is_empty() {
+            let last = total_days.saturating_sub(1);
+            if last >= self.config.burn_in_days {
+                let sim_day = last - self.config.burn_in_days;
+                if self.stats.staleness_per_day.len() <= sim_day as usize {
+                    self.collect_statistics(sim_day);
                 }
             }
+            return None;
         }
         let se = self.event_queue.pop()?;
         let at = se.time();
@@ -635,12 +661,28 @@ impl Simulator {
         Some((event, at))
     }
 
+    /// True once all simulated days have been scheduled and the event queue is empty.
+    pub fn is_done(&self) -> bool {
+        let total_days = self.config.burn_in_days + self.config.days;
+        self.event_queue.is_empty() && self.next_churn_day >= total_days
+    }
+
+    /// Returns (is_burn_in, display_day, total_display_days) for the current simulation position.
+    /// `display_day` is 1-based and relative to the phase (burn-in or live).
+    pub fn day_progress(&self) -> (bool, u64, u64) {
+        let day = self.next_churn_day.saturating_sub(1);
+        let burn_in = self.config.burn_in_days;
+        if day < burn_in {
+            (true, day + 1, burn_in)
+        } else {
+            (false, day - burn_in + 1, self.config.days)
+        }
+    }
+
     pub fn add_event(&mut self, event: Event) {
         let at = event_time(&event);
         self.event_queue.push(ScheduledEvent::new(event, at));
     }
-
-
 }
 
 /// Returns 0 for onion-only, 1 for clearnet-only, 2 for dual-stack.
@@ -659,9 +701,6 @@ fn log_event(event: &Event) {
         }
         Event::NodeLeave { node_id, at } => {
             log::trace!(target: "hyper_lib::event", "t={at} NodeLeave node={node_id}");
-        }
-        Event::SelfAnnounce { node_id, peer_addr, at } => {
-            log::trace!(target: "hyper_lib::event", "t={at} SelfAnnounce node={node_id} peer={peer_addr:?}");
         }
         Event::NodeReconnect { node_id, network, at } => {
             log::trace!(target: "hyper_lib::event", "t={at} NodeReconnect node={node_id} net={network:?}");
@@ -682,7 +721,6 @@ fn event_time(event: &Event) -> u64 {
         Event::SendMessage { at, .. } => *at,
         Event::NodeJoin { at, .. } => *at,
         Event::NodeLeave { at, .. } => *at,
-        Event::SelfAnnounce { at, .. } => *at,
         Event::NodeReconnect { at, .. } => *at,
     }
 }
