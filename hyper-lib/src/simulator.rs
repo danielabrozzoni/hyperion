@@ -289,7 +289,6 @@ impl Simulator {
             self.day_joined = [0; 3];
             self.day_left = [0; 3];
             let day_start = self.start_time + day * 86400;
-            self.do_daily_self_announce(day_start);
             self.schedule_churn(day);
             self.next_churn_day = day + 1;
             self.run_until(day_start + 86399);
@@ -319,21 +318,6 @@ impl Simulator {
                     f.avg_overlap,
                     f.nodes_sampled,
                 );
-            }
-        }
-    }
-
-    fn do_daily_self_announce(&mut self, now: u64) {
-        let target = self.config.outbounds;
-        let node_ids: Vec<_> = self.network.nodes.keys().copied().collect();
-        for node_id in node_ids {
-            let top_up_events = self.network.top_up_outbounds(node_id, target, now, &mut self.rng);
-            for e in top_up_events {
-                self.add_event(e);
-            }
-            let events = self.network.nodes.get_mut(&node_id).unwrap().self_announce(now);
-            for e in events {
-                self.add_event(e);
             }
         }
     }
@@ -410,7 +394,7 @@ impl Simulator {
                     (vec![NetworkType::Clearnet], HashSet::new())
                 };
                 let idx = node_type_idx(&networks);
-                let (node_id, mut events) = self.network.add_node(
+                let (_node_id, events) = self.network.add_node(
                     networks,
                     reachable_on,
                     outbounds,
@@ -418,7 +402,6 @@ impl Simulator {
                     at,
                     &mut self.rng,
                 );
-                events.extend(self.network.nodes.get_mut(&node_id).unwrap().self_announce(at));
                 self.day_joined[idx] += 1;
                 events
             }
@@ -485,6 +468,23 @@ impl Simulator {
                             .receive_addr_announce(from, addrs, at, registry, &mut self.rng)
                     }
                 }
+            }
+            Event::SelfAnnounce { node_id, peer_addr, at } => {
+                let node = match self.network.nodes.get_mut(&node_id) {
+                    Some(n) => n,
+                    None => return vec![],
+                };
+                // Peer may have disconnected before the timer fired — skip silently.
+                if !node.out_peers.contains_key(&peer_addr) && !node.in_peers.contains_key(&peer_addr) {
+                    return vec![];
+                }
+                let mut events = node.self_announce_to_peer(peer_addr, at);
+                events.push(Event::SelfAnnounce {
+                    node_id,
+                    peer_addr,
+                    at: at + rand_exp_secs(&mut self.rng, 86400),
+                });
+                events
             }
         }
     }
@@ -599,7 +599,6 @@ impl Simulator {
                     self.day_joined = [0; 3];
                     self.day_left = [0; 3];
                 }
-                self.do_daily_self_announce(day_start);
                 self.schedule_churn(self.next_churn_day);
                 self.next_churn_day += 1;
             } else {
@@ -651,6 +650,13 @@ impl Simulator {
     }
 }
 
+/// Sample from an exponential distribution with the given mean (in seconds).
+/// Mirrors Bitcoin Core's FastRandomContext::rand_exp_duration.
+fn rand_exp_secs(rng: &mut impl Rng, mean_secs: u64) -> u64 {
+    let u: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+    (-u.ln() * mean_secs as f64) as u64
+}
+
 /// Returns 0 for onion-only, 1 for clearnet-only, 2 for dual-stack.
 fn node_type_idx(networks: &[NetworkType]) -> usize {
     match networks {
@@ -679,6 +685,9 @@ fn log_event(event: &Event) {
             };
             log::trace!(target: "hyper_lib::event", "t={at} {kind} from={from:?} to={to:?}");
         }
+        Event::SelfAnnounce { node_id, peer_addr, at } => {
+            log::trace!(target: "hyper_lib::event", "t={at} SelfAnnounce node={node_id} peer={peer_addr:?}");
+        }
     }
 }
 
@@ -688,5 +697,6 @@ fn event_time(event: &Event) -> u64 {
         Event::NodeJoin { at, .. } => *at,
         Event::NodeLeave { at, .. } => *at,
         Event::NodeReconnect { at, .. } => *at,
+        Event::SelfAnnounce { at, .. } => *at,
     }
 }

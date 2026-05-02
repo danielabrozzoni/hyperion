@@ -130,6 +130,10 @@ impl Network {
                 .unwrap()
                 .on_connect(from_addr, false, now),
         );
+        // Schedule immediate self-announcements for both sides.
+        // Mirrors Bitcoin Core's m_next_local_addr_send initialized to 0 (fires on first tick).
+        events.push(Event::SelfAnnounce { node_id: from_node, peer_addr: to_addr, at: now });
+        events.push(Event::SelfAnnounce { node_id: to_node, peer_addr: from_addr, at: now });
         events
     }
 

@@ -63,7 +63,7 @@ pub struct Peer {
     pub getaddr_sent: bool,
     pub getaddr_recvd: bool,
     /// Addresses this peer already knows; checked before relaying to them.
-    /// Reset daily (in self_announce) so self-announcements always go out.
+    /// Reset before each periodic self-announcement so it always goes out.
     pub addr_known: HashSet<AddressId>,
 }
 
@@ -103,6 +103,8 @@ pub enum Event {
     NodeLeave { node_id: NodeId, at: u64 },
     /// An outbound peer disconnected; the node should find a replacement on that network.
     NodeReconnect { node_id: NodeId, network: NetworkType, at: u64 },
+    /// Fire self-announcement to a single peer; rescheduled exponentially (~24 h mean).
+    SelfAnnounce { node_id: NodeId, peer_addr: AddressId, at: u64 },
 }
 
 impl Node {
@@ -314,41 +316,39 @@ impl Node {
             .choose_multiple(rng, n)
     }
 
-    /// Send our own address to every connected peer once (called daily by the simulator).
-    pub fn self_announce(&mut self, now: u64) -> Vec<Event> {
-        protocol_log!(now, self.node_id, "DailySelfAnnounce");
-        let mut events = vec![];
+    /// Send our own address to one peer. Mirrors Bitcoin Core's per-peer
+    /// m_next_local_addr_send timer in SendMessages (net_processing.cpp:5448).
+    /// Returns an empty Vec if this node is not reachable on the peer's network.
+    pub fn self_announce_to_peer(&mut self, peer_addr: AddressId, now: u64) -> Vec<Event> {
+        protocol_log!(now, self.node_id, "SelfAnnounce peer={peer_addr:?}");
 
-        let peer_addrs: Vec<AddressId> = self.out_peers.keys().chain(self.in_peers.keys()).copied().collect();
-        for peer_addr in peer_addrs {
-            // Reset addr_known so the announcement always goes out even if the peer's
-            // filter has seen our address before. Mirrors Bitcoin Core's m_addr_known->reset()
-            // in SendMessages (net_processing.cpp).
-            if let Some(peer) = self.out_peers.get_mut(&peer_addr).or_else(|| self.in_peers.get_mut(&peer_addr)) {
-                peer.addr_known.clear();
-            }
-
-            let own_addr = self
-                .addresses
-                .iter()
-                .find(|a| a.network == peer_addr.network && self.reachable_networks.contains(&a.network))
-                .copied();
-
-            if let Some(addr) = own_addr {
-                events.push(Event::SendMessage {
-                    from: addr,
-                    to: peer_addr,
-                    msg: NetworkMessage::AddrAnnounce(vec![AddrPayload {
-                        address: addr,
-                        timestamp: now,
-                    }]),
-                    at: now,
-                });
-                self.node_statistics.addr_announce_sent += 1;
-            }
+        // Reset addr_known so the announcement always goes out even if the peer's
+        // filter has seen our address before. Mirrors Bitcoin Core's m_addr_known->reset()
+        // in SendMessages (net_processing.cpp:5457-5459).
+        if let Some(peer) = self.out_peers.get_mut(&peer_addr).or_else(|| self.in_peers.get_mut(&peer_addr)) {
+            peer.addr_known.clear();
         }
 
-        events
+        let own_addr = self
+            .addresses
+            .iter()
+            .find(|a| a.network == peer_addr.network && self.reachable_networks.contains(&a.network))
+            .copied();
+
+        if let Some(addr) = own_addr {
+            self.node_statistics.addr_announce_sent += 1;
+            vec![Event::SendMessage {
+                from: addr,
+                to: peer_addr,
+                msg: NetworkMessage::AddrAnnounce(vec![AddrPayload {
+                    address: addr,
+                    timestamp: now,
+                }]),
+                at: now,
+            }]
+        } else {
+            vec![]
+        }
     }
 
     pub fn on_connect(

@@ -263,6 +263,9 @@ fn event_description(event: &Event, reg: &AddressRegistry) -> String {
                 }
             }
         },
+        Event::SelfAnnounce { node_id, peer_addr, .. } => {
+            format!("self-announce timer  node={} peer={:?}", node_id, peer_addr)
+        }
     }
 }
 
