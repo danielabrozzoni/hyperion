@@ -103,7 +103,8 @@ impl Simulator {
         let now = self.start_time;
 
         // Copy all config values to locals to avoid borrow conflicts.
-        let onion = self.config.onion;
+        let tor_onlynet = self.config.tor_onlynet;
+        let tor_proxy = self.config.tor_proxy;
         let clearnet = self.config.clearnet;
         let dual_stack = self.config.dual_stack;
         let reachable_clearnet_pct = self.config.reachable_clearnet_pct as usize;
@@ -113,35 +114,51 @@ impl Simulator {
         let start_mode = self.config.start_mode;
 
         let clearnet_reachable = clearnet * reachable_clearnet_pct / 100;
-        let onion_reachable = onion * reachable_onion_pct / 100;
+        let tor_onlynet_reachable = tor_onlynet * reachable_onion_pct / 100;
+        let tor_proxy_reachable = tor_proxy * reachable_onion_pct / 100;
         let dual_clearnet_reachable = dual_stack * reachable_clearnet_pct / 100;
         let dual_onion_reachable = dual_stack * reachable_onion_pct / 100;
 
-        let total = onion + clearnet + dual_stack;
+        let total = tor_onlynet + tor_proxy + clearnet + dual_stack;
         log::info!(
-            "Building network: {} nodes ({} onion, {} clearnet, {} dual-stack), {} outbounds each",
-            total, onion, clearnet, dual_stack, outbounds
+            "Building network: {} nodes ({} tor-onlynet, {} tor-proxy, {} clearnet, {} dual-stack), {} outbounds each",
+            total, tor_onlynet, tor_proxy, clearnet, dual_stack, outbounds
         );
 
         let t_build = std::time::Instant::now();
 
-        for i in 0..onion {
-            let reachable_on = if i < onion_reachable {
+        for i in 0..tor_onlynet {
+            let reachable_on: HashSet<NetworkType> = if i < tor_onlynet_reachable {
                 [NetworkType::Onion].into()
             } else {
                 HashSet::new()
             };
-            self.network.add_node(vec![NetworkType::Onion], reachable_on, 0, algo, now, &mut self.rng);
+            let outbound: HashSet<NetworkType> = [NetworkType::Onion].into();
+            self.network.add_node(vec![NetworkType::Onion], reachable_on, outbound, 0, algo, now, &mut self.rng);
         }
-        log::debug!("Added {} onion-only nodes ({} reachable)", onion, onion_reachable);
+        log::debug!("Added {} tor-onlynet nodes ({} reachable)", tor_onlynet, tor_onlynet_reachable);
+
+        for i in 0..tor_proxy {
+            let reachable_on: HashSet<NetworkType> = if i < tor_proxy_reachable {
+                [NetworkType::Onion].into()
+            } else {
+                HashSet::new()
+            };
+            let outbound: HashSet<NetworkType> = [NetworkType::Clearnet, NetworkType::Onion].into();
+            // Clearnet address included for routing outbound connections through the proxy;
+            // it is not reachable (no clearnet listener) and is never self-announced.
+            self.network.add_node(vec![NetworkType::Onion, NetworkType::Clearnet], reachable_on, outbound, 0, algo, now, &mut self.rng);
+        }
+        log::debug!("Added {} tor-proxy nodes ({} reachable)", tor_proxy, tor_proxy_reachable);
 
         for i in 0..clearnet {
-            let reachable_on = if i < clearnet_reachable {
+            let reachable_on: HashSet<NetworkType> = if i < clearnet_reachable {
                 [NetworkType::Clearnet].into()
             } else {
                 HashSet::new()
             };
-            self.network.add_node(vec![NetworkType::Clearnet], reachable_on, 0, algo, now, &mut self.rng);
+            let outbound: HashSet<NetworkType> = [NetworkType::Clearnet].into();
+            self.network.add_node(vec![NetworkType::Clearnet], reachable_on, outbound, 0, algo, now, &mut self.rng);
         }
         log::debug!("Added {} clearnet-only nodes ({} reachable)", clearnet, clearnet_reachable);
 
@@ -153,7 +170,8 @@ impl Simulator {
             if i < dual_clearnet_reachable {
                 reachable_on.insert(NetworkType::Clearnet);
             }
-            self.network.add_node(vec![NetworkType::Onion, NetworkType::Clearnet], reachable_on, 0, algo, now, &mut self.rng);
+            let outbound: HashSet<NetworkType> = [NetworkType::Clearnet, NetworkType::Onion].into();
+            self.network.add_node(vec![NetworkType::Onion, NetworkType::Clearnet], reachable_on, outbound, 0, algo, now, &mut self.rng);
         }
         log::debug!(
             "Added {} dual-stack nodes ({} onion-reachable, {} clearnet-reachable)",
@@ -368,35 +386,53 @@ impl Simulator {
             Event::NodeJoin { at } => {
                 let algo = self.config.cache_algo;
                 let outbounds = self.config.outbounds;
-                let total = self.config.onion + self.config.clearnet + self.config.dual_stack;
-                let (networks, reachable_on) = if total > 0 {
+                let tor_onlynet = self.config.tor_onlynet;
+                let tor_proxy = self.config.tor_proxy;
+                let clearnet = self.config.clearnet;
+                let dual_stack = self.config.dual_stack;
+                let reachable_onion_pct = self.config.reachable_onion_pct as usize;
+                let reachable_clearnet_pct = self.config.reachable_clearnet_pct as usize;
+                let total = tor_onlynet + tor_proxy + clearnet + dual_stack;
+                let (networks, reachable_on, outbound_networks) = if total > 0 {
                     let roll = self.rng.random_range(0..total);
-                    if roll < self.config.onion {
-                        let reachable = roll < self.config.onion * self.config.reachable_onion_pct as usize / 100;
-                        let r = if reachable { [NetworkType::Onion].into() } else { HashSet::new() };
-                        (vec![NetworkType::Onion], r)
-                    } else if roll < self.config.onion + self.config.clearnet {
-                        let reachable = (roll - self.config.onion) < self.config.clearnet * self.config.reachable_clearnet_pct as usize / 100;
-                        let r = if reachable { [NetworkType::Clearnet].into() } else { HashSet::new() };
-                        (vec![NetworkType::Clearnet], r)
+                    if roll < tor_onlynet {
+                        let reachable = roll < tor_onlynet * reachable_onion_pct / 100;
+                        let r: HashSet<NetworkType> = if reachable { [NetworkType::Onion].into() } else { HashSet::new() };
+                        let out: HashSet<NetworkType> = [NetworkType::Onion].into();
+                        (vec![NetworkType::Onion], r, out)
+                    } else if roll < tor_onlynet + tor_proxy {
+                        let i = roll - tor_onlynet;
+                        let reachable = i < tor_proxy * reachable_onion_pct / 100;
+                        let r: HashSet<NetworkType> = if reachable { [NetworkType::Onion].into() } else { HashSet::new() };
+                        let out: HashSet<NetworkType> = [NetworkType::Clearnet, NetworkType::Onion].into();
+                        (vec![NetworkType::Onion, NetworkType::Clearnet], r, out)
+                    } else if roll < tor_onlynet + tor_proxy + clearnet {
+                        let i = roll - tor_onlynet - tor_proxy;
+                        let reachable = i < clearnet * reachable_clearnet_pct / 100;
+                        let r: HashSet<NetworkType> = if reachable { [NetworkType::Clearnet].into() } else { HashSet::new() };
+                        let out: HashSet<NetworkType> = [NetworkType::Clearnet].into();
+                        (vec![NetworkType::Clearnet], r, out)
                     } else {
-                        let i = roll - self.config.onion - self.config.clearnet;
+                        let i = roll - tor_onlynet - tor_proxy - clearnet;
                         let mut r = HashSet::new();
-                        if i < self.config.dual_stack * self.config.reachable_onion_pct as usize / 100 {
+                        if i < dual_stack * reachable_onion_pct / 100 {
                             r.insert(NetworkType::Onion);
                         }
-                        if i < self.config.dual_stack * self.config.reachable_clearnet_pct as usize / 100 {
+                        if i < dual_stack * reachable_clearnet_pct / 100 {
                             r.insert(NetworkType::Clearnet);
                         }
-                        (vec![NetworkType::Onion, NetworkType::Clearnet], r)
+                        let out: HashSet<NetworkType> = [NetworkType::Clearnet, NetworkType::Onion].into();
+                        (vec![NetworkType::Onion, NetworkType::Clearnet], r, out)
                     }
                 } else {
-                    (vec![NetworkType::Clearnet], HashSet::new())
+                    let out: HashSet<NetworkType> = [NetworkType::Clearnet].into();
+                    (vec![NetworkType::Clearnet], HashSet::new(), out)
                 };
                 let idx = node_type_idx(&networks);
                 let (_node_id, events) = self.network.add_node(
                     networks,
                     reachable_on,
+                    outbound_networks,
                     outbounds,
                     algo,
                     at,

@@ -43,13 +43,17 @@ impl From<CacheAlgo> for GetaddrCacheAlgorithm {
 #[derive(Parser)]
 #[command(name = "hyperion-addr", version, about = "Bitcoin P2P address relay simulator")]
 pub struct Cli {
-    /// Onion-only nodes
-    #[clap(long, default_value_t = 1000)]
-    pub onion: usize,
-
-    /// Clearnet-only nodes
+    /// Clearnet-only nodes (no Tor proxy, outbound clearnet only)
     #[clap(long, default_value_t = 8000)]
     pub clearnet: usize,
+
+    /// Tor proxy nodes: hidden service + SOCKS5 proxy, no -onlynet (outbound: clearnet + Tor)
+    #[clap(long, default_value_t = 800)]
+    pub tor_proxy: usize,
+
+    /// Tor-onlynet nodes: -onlynet=onion (outbound: Tor only)
+    #[clap(long, default_value_t = 200)]
+    pub tor_onlynet: usize,
 
     /// Dual-stack nodes (one address per network)
     #[clap(long, default_value_t = 1000)]
@@ -123,8 +127,9 @@ impl Cli {
 
     pub fn into_config(self) -> SimulationConfig {
         SimulationConfig {
-            onion: self.onion,
             clearnet: self.clearnet,
+            tor_proxy: self.tor_proxy,
+            tor_onlynet: self.tor_onlynet,
             dual_stack: self.dual_stack,
             reachable_clearnet_pct: self.reachable_clearnet_pct,
             reachable_onion_pct: self.reachable_onion_pct,

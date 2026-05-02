@@ -22,8 +22,13 @@ pub enum StartMode {
 }
 
 pub struct SimulationConfig {
-    pub onion: usize,
+    /// Clearnet-only nodes (outbound: clearnet only).
     pub clearnet: usize,
+    /// Tor nodes with SOCKS5 proxy, no -onlynet (outbound: clearnet + Tor; inbound: Tor).
+    pub tor_proxy: usize,
+    /// Tor-only nodes with -onlynet=onion (outbound: Tor only; inbound: Tor).
+    pub tor_onlynet: usize,
+    /// Dual-stack nodes: clearnet listener + Tor hidden service (outbound: both; inbound: both).
     pub dual_stack: usize,
     pub reachable_clearnet_pct: u8,
     pub reachable_onion_pct: u8,

@@ -45,7 +45,11 @@ const HOURS: u64 = 3600;
 pub struct Node {
     pub node_id: NodeId,
     pub addresses: Vec<AddressId>,
+    /// Networks on which this node accepts inbound connections (has a listener).
     pub reachable_networks: HashSet<NetworkType>,
+    /// Networks this node initiates outbound connections to.
+    /// Tor-proxy nodes have {Clearnet, Tor}; -onlynet=onion nodes have {Tor}.
+    pub outbound_networks: HashSet<NetworkType>,
 
     pub out_peers: BTreeMap<AddressId, Peer>,
     pub in_peers: BTreeMap<AddressId, Peer>,
@@ -263,9 +267,6 @@ impl Node {
                 continue;
             }
             if peer_sent_getaddr {
-                continue;
-            }
-            if !registry.is_active(payload.address) {
                 continue;
             }
 

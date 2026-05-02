@@ -31,6 +31,7 @@ impl Network {
         &mut self,
         networks: Vec<NetworkType>,
         reachable_on: HashSet<NetworkType>,
+        outbound_networks: HashSet<NetworkType>,
         n_outbound: usize,
         cache_algo: GetaddrCacheAlgorithm,
         now: u64,
@@ -54,13 +55,14 @@ impl Network {
 
         log::trace!(
             target: "hyper_lib::topology",
-            "t={now} add_node id={node_id} networks={networks:?} reachable={reachable_on:?}"
+            "t={now} add_node id={node_id} networks={networks:?} reachable={reachable_on:?} outbound={outbound_networks:?}"
         );
 
         let node = Node {
             node_id,
             addresses: addresses.clone(),
             reachable_networks: reachable_on,
+            outbound_networks,
             out_peers: BTreeMap::new(),
             in_peers: BTreeMap::new(),
             addrman: Addrman::new(),

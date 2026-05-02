@@ -42,6 +42,23 @@ The simulation models a Bitcoin-like P2P network over days/weeks and measures bo
 
 All behaviors in this section have been verified against the Bitcoin Core source. Only `OUTBOUND_FULL_RELAY` and `INBOUND` connections are simulated.
 
+### Node Types
+
+Four node types are modeled, corresponding to real Bitcoin Core configurations:
+
+| Type | CLI | Inbound (`reachable_networks`) | Outbound (`outbound_networks`) | Addresses |
+|------|-----|-------------------------------|-------------------------------|-----------|
+| Clearnet-only | `--clearnet` | `{Clearnet}` (if reachable) | `{Clearnet}` | clearnet |
+| Tor-proxy | `--tor-proxy` | `{Tor}` (if reachable) | `{Clearnet, Tor}` | tor + clearnet (routing only) |
+| Tor-onlynet | `--tor-onlynet` | `{Tor}` (if reachable) | `{Tor}` | tor |
+| Dual-stack | `--dual-stack` | `{Clearnet, Tor}` (each if reachable) | `{Clearnet, Tor}` | both |
+
+**Tor-proxy** nodes model a Bitcoin Core node with a SOCKS5 Tor proxy but without `-onlynet=onion`. They can connect outbound to both clearnet and Tor peers, but have no clearnet listener. In the simulation they hold a private clearnet `AddressId` used only for routing outbound-initiated messages (never self-announced, `is_reachable = false` in the registry).
+
+**Tor-onlynet** nodes model `-onlynet=onion`. Only Tor outbound connections are made.
+
+The distinction between `reachable_networks` (inbound) and `outbound_networks` (outbound) mirrors Bitcoin Core's separation between `fListen` and `g_reachable_nets`.
+
 ### Node Reachability
 
 A node is **reachable on a network** if it listens for inbound connections on that network (`fListen == true`). Reachability is modeled per-network because a dual-stack node may accept inbound connections on its onion address but not its clearnet address (e.g., NAT'd at home but running a Tor hidden service).

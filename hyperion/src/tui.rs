@@ -553,10 +553,10 @@ fn draw_params_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
         StartMode::Peers => "peers",
         StartMode::Dns => "dns",
     };
-    let total = c.onion + c.clearnet + c.dual_stack;
+    let total = c.tor_onlynet + c.tor_proxy + c.clearnet + c.dual_stack;
     let text = format!(
-        " algo: {}   nodes: {} (onion={} clear={} dual={})   start: {}   days: {}   churn: +{}/−{}/day ",
-        algo, total, c.onion, c.clearnet, c.dual_stack, start, c.days, c.joins_per_day, c.leaves_per_day,
+        " algo: {}   nodes: {} (tor-onlynet={} tor-proxy={} clear={} dual={})   start: {}   days: {}   churn: +{}/−{}/day ",
+        algo, total, c.tor_onlynet, c.tor_proxy, c.clearnet, c.dual_stack, start, c.days, c.joins_per_day, c.leaves_per_day,
     );
     let style = Style::default().fg(Color::DarkGray);
     f.render_widget(Paragraph::new(text).style(style), area);
