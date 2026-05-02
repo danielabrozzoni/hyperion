@@ -41,7 +41,6 @@ const HOURS: u64 = 3600;
 /// With the 10-minute freshness filter this caps relay chains at ~20 hops, matching
 /// real-network behaviour where an addr reaches the whole network or dies within
 /// 10 minutes of its timestamp.
-const RELAY_HOP_DELAY: u64 = 30;
 
 pub struct Node {
     pub node_id: NodeId,
@@ -62,9 +61,12 @@ pub struct Peer {
     pub addr: AddressId,
     pub getaddr_sent: bool,
     pub getaddr_recvd: bool,
-    /// Addresses this peer already knows; checked before relaying to them.
+    /// Addresses this peer already knows; checked before queuing relays to them.
     /// Reset before each periodic self-announcement so it always goes out.
     pub addr_known: HashSet<AddressId>,
+    /// Addresses queued for relay to this peer, flushed every 30 s.
+    /// Mirrors Bitcoin Core's per-peer m_addrs_to_send vector.
+    pub pending_relay: Vec<AddrPayload>,
 }
 
 /// GETADDR cache for one network type. Timestamps are frozen at build time.
@@ -105,6 +107,9 @@ pub enum Event {
     NodeReconnect { node_id: NodeId, network: NetworkType, at: u64 },
     /// Fire self-announcement to a single peer; rescheduled exponentially (~24 h mean).
     SelfAnnounce { node_id: NodeId, peer_addr: AddressId, at: u64 },
+    /// Flush the pending relay queue to a peer; rescheduled every 30 s.
+    /// Mirrors Bitcoin Core's per-peer m_next_addr_send timer in SendMessages.
+    FlushAddrQueue { node_id: NodeId, peer_addr: AddressId, at: u64 },
 }
 
 impl Node {
@@ -229,7 +234,7 @@ impl Node {
         let batch_size = addrs.len();
         protocol_log!(now, self.node_id, "AddrAnnounce {batch_size} entries from={from:?}");
         self.node_statistics.addr_announce_received += 1;
-        let mut events = vec![];
+        let events = vec![];
 
         for payload in &addrs {
             let penalty = if payload.address == from { 0 } else { 2 * HOURS };
@@ -267,26 +272,41 @@ impl Node {
             let n_relay = self.relay_count(payload.address, registry, rng);
             let targets = self.select_relay_peers(from, n_relay, rng);
             for target in targets {
-                // Skip peers that already know this address; insert before sending.
-                // Mirrors Bitcoin Core's addr_already_known check in SendMessages.
+                // Skip peers that already know this address; mark known at queue time.
+                // Mirrors Bitcoin Core's PushAddress preliminary addr_known check.
                 if self.out_peers.get(&target).map_or(false, |p| p.addr_known.contains(&payload.address)) {
                     continue;
                 }
                 if let Some(peer) = self.out_peers.get_mut(&target) {
                     peer.addr_known.insert(payload.address);
+                    peer.pending_relay.push(payload.clone());
+                    protocol_trace!(now, self.node_id, "  queued relay addr={:?} → peer={target:?}", payload.address);
                 }
-                protocol_trace!(now, self.node_id, "  relay addr={:?} → peer={target:?}", payload.address);
-                events.push(Event::SendMessage {
-                    from: self.own_addr_for_network(target.network),
-                    to: target,
-                    msg: NetworkMessage::AddrAnnounce(vec![payload.clone()]),
-                    at: now + RELAY_HOP_DELAY,
-                });
             }
         }
 
-        self.node_statistics.addr_announce_sent += events.len() as u64;
         events
+    }
+
+    /// Flush all pending relay addresses to `peer_addr` in one batch message.
+    /// Mirrors Bitcoin Core's m_next_addr_send flush in SendMessages.
+    pub fn flush_addr_queue(&mut self, peer_addr: AddressId, now: u64) -> Vec<Event> {
+        let peer = match self.out_peers.get_mut(&peer_addr).or_else(|| self.in_peers.get_mut(&peer_addr)) {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let batch: Vec<AddrPayload> = peer.pending_relay.drain(..).collect();
+        if batch.is_empty() {
+            return vec![];
+        }
+        protocol_log!(now, self.node_id, "FlushAddrQueue {} addrs → peer={peer_addr:?}", batch.len());
+        self.node_statistics.addr_announce_sent += 1;
+        vec![Event::SendMessage {
+            from: self.own_addr_for_network(peer_addr.network),
+            to: peer_addr,
+            msg: NetworkMessage::AddrAnnounce(batch),
+            at: now,
+        }]
     }
 
     fn relay_count(
@@ -367,6 +387,7 @@ impl Node {
             getaddr_sent: false,
             getaddr_recvd: false,
             addr_known: HashSet::new(),
+            pending_relay: vec![],
         };
         let mut events = vec![];
 

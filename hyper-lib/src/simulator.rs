@@ -486,6 +486,19 @@ impl Simulator {
                 });
                 events
             }
+            Event::FlushAddrQueue { node_id, peer_addr, at } => {
+                let node = match self.network.nodes.get_mut(&node_id) {
+                    Some(n) => n,
+                    None => return vec![],
+                };
+                // Peer may have disconnected before the timer fired — skip silently.
+                if !node.out_peers.contains_key(&peer_addr) && !node.in_peers.contains_key(&peer_addr) {
+                    return vec![];
+                }
+                let mut events = node.flush_addr_queue(peer_addr, at);
+                events.push(Event::FlushAddrQueue { node_id, peer_addr, at: at + 30 });
+                events
+            }
         }
     }
 
@@ -688,6 +701,9 @@ fn log_event(event: &Event) {
         Event::SelfAnnounce { node_id, peer_addr, at } => {
             log::trace!(target: "hyper_lib::event", "t={at} SelfAnnounce node={node_id} peer={peer_addr:?}");
         }
+        Event::FlushAddrQueue { node_id, peer_addr, at } => {
+            log::trace!(target: "hyper_lib::event", "t={at} FlushAddrQueue node={node_id} peer={peer_addr:?}");
+        }
     }
 }
 
@@ -698,5 +714,6 @@ fn event_time(event: &Event) -> u64 {
         Event::NodeLeave { at, .. } => *at,
         Event::NodeReconnect { at, .. } => *at,
         Event::SelfAnnounce { at, .. } => *at,
+        Event::FlushAddrQueue { at, .. } => *at,
     }
 }

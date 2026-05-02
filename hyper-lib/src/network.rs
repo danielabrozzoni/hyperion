@@ -134,6 +134,10 @@ impl Network {
         // Mirrors Bitcoin Core's m_next_local_addr_send initialized to 0 (fires on first tick).
         events.push(Event::SelfAnnounce { node_id: from_node, peer_addr: to_addr, at: now });
         events.push(Event::SelfAnnounce { node_id: to_node, peer_addr: from_addr, at: now });
+        // Schedule addr-relay flush timers (30 s interval).
+        // Mirrors Bitcoin Core's m_next_addr_send timer in SendMessages.
+        events.push(Event::FlushAddrQueue { node_id: from_node, peer_addr: to_addr, at: now + 30 });
+        events.push(Event::FlushAddrQueue { node_id: to_node, peer_addr: from_addr, at: now + 30 });
         events
     }
 
