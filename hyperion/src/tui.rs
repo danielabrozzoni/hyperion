@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossterm::event::{
     self, Event as TermEvent, KeyCode, KeyEventKind, MouseButton, MouseEventKind,
@@ -23,8 +23,6 @@ use hyper_lib::StartMode;
 
 const EVENT_LOG_CAP: usize = 500;
 const TICK_MS: u64 = 10;
-/// How long (wall-clock seconds) a departed node stays visible as a ghost in the node list.
-const DEPARTED_DISPLAY_SECS: u64 = 5;
 
 /// Whether an event is an internal scheduling step or an actual network delivery.
 #[derive(Clone, Copy, PartialEq)]
@@ -58,9 +56,8 @@ pub struct App {
     // Nodes that joined/left in the most recent step — cleared at next step.
     recently_joined: HashSet<NodeId>,
     recently_left: HashSet<NodeId>,
-    // Recently departed nodes shown as ghosts in the list: (id, type_str, wall-time of departure).
-    // Entries are removed after DEPARTED_DISPLAY_SECS seconds of real time.
-    departed_display: VecDeque<(NodeId, &'static str, Instant)>,
+    // Departed nodes shown as ghosts in the list — persist until simulation ends.
+    departed_display: VecDeque<(NodeId, &'static str)>,
     // Panel rects — updated each draw, used for mouse hit-testing.
     rect_node_list: Rect,
     rect_detail: Rect,
@@ -112,19 +109,9 @@ impl App {
             self.recently_left = before.difference(&after).copied().collect();
 
             // Add departed nodes to the ghost display list.
-            let now_wall = Instant::now();
             for &id in &self.recently_left {
                 let type_str = before_types.get(&id).copied().unwrap_or("?");
-                self.departed_display.push_back((id, type_str, now_wall));
-            }
-            // Prune ghosts older than DEPARTED_DISPLAY_SECS.
-            let cutoff = Duration::from_secs(DEPARTED_DISPLAY_SECS);
-            while let Some(&(_, _, t)) = self.departed_display.front() {
-                if now_wall.duration_since(t) > cutoff {
-                    self.departed_display.pop_front();
-                } else {
-                    break;
-                }
+                self.departed_display.push_back((id, type_str));
             }
 
             let kind = match &event {
@@ -581,22 +568,10 @@ fn draw_node_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize;
     app.scroll_list_to_show_selected(inner_height);
 
-    // Prune departed ghosts that have expired (done here so it works even when paused).
-    let cutoff = Duration::from_secs(DEPARTED_DISPLAY_SECS);
-    let now_wall = Instant::now();
-    while let Some(&(_, _, t)) = app.departed_display.front() {
-        if now_wall.duration_since(t) > cutoff {
-            app.departed_display.pop_front();
-        } else {
-            break;
-        }
-    }
-
-    // Build departed ghost rows (may be fewer than departed_display if space runs out).
     let departed_snapshot: Vec<(NodeId, &'static str)> = app
         .departed_display
         .iter()
-        .map(|&(id, type_str, _)| (id, type_str))
+        .copied()
         .collect();
 
     let live_items: Vec<ListItem> = app
