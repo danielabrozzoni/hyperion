@@ -35,6 +35,7 @@ The simulation models a Bitcoin-like P2P network over days/weeks and measures bo
 | **New vs tried addrman tables** | The distinction matters only for feeler target selection, which we don't model. We use a flat addrman map. |
 | **Network latency** | Day-scale simulation; sub-second effects are irrelevant. |
 | **VERSION/VERACK handshake** | Simplified: connection succeeds if the target node is active, fails if it has departed. |
+| **Addr-relay flush timing** | In Bitcoin Core, `m_next_addr_send` is initialized to a random value in `[1s, 30s]` on connect, so the first flush happens on average ~15 s after connect. In the simulator the flush timer is only armed when the first address is enqueued, and always fires exactly 30 s later — so the first relay always waits a full 30 s. The difference is negligible at day-scale but means simulated relay latency is slightly pessimistic. |
 
 ---
 

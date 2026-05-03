@@ -531,9 +531,7 @@ impl Simulator {
                 if !node.out_peers.contains_key(&peer_addr) && !node.in_peers.contains_key(&peer_addr) {
                     return vec![];
                 }
-                let mut events = node.flush_addr_queue(peer_addr, at);
-                events.push(Event::FlushAddrQueue { node_id, peer_addr, at: at + 30 });
-                events
+                node.flush_addr_queue(peer_addr, at)
             }
         }
     }

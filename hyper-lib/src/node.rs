@@ -71,6 +71,9 @@ pub struct Peer {
     /// Addresses queued for relay to this peer, flushed every 30 s.
     /// Mirrors Bitcoin Core's per-peer m_addrs_to_send vector.
     pub pending_relay: Vec<AddrPayload>,
+    /// True when a FlushAddrQueue event is already scheduled for this peer.
+    /// Avoids scheduling redundant flush timers.
+    pub flush_scheduled: bool,
 }
 
 /// GETADDR cache for one network type. Timestamps are frozen at build time.
@@ -238,7 +241,7 @@ impl Node {
         let batch_size = addrs.len();
         protocol_log!(now, self.node_id, "AddrAnnounce {batch_size} entries from={from:?}");
         self.node_statistics.addr_announce_received += 1;
-        let events = vec![];
+        let mut events = vec![];
 
         for payload in &addrs {
             let penalty = if payload.address == from { 0 } else { 2 * HOURS };
@@ -280,8 +283,15 @@ impl Node {
                 }
                 if let Some(peer) = self.out_peers.get_mut(&target) {
                     peer.addr_known.insert(payload.address);
+                    let need_flush = !peer.flush_scheduled;
+                    if need_flush {
+                        peer.flush_scheduled = true;
+                    }
                     peer.pending_relay.push(payload.clone());
                     protocol_trace!(now, self.node_id, "  queued relay addr={:?} → peer={target:?}", payload.address);
+                    if need_flush {
+                        events.push(Event::FlushAddrQueue { node_id: self.node_id, peer_addr: target, at: now + 30 });
+                    }
                 }
             }
         }
@@ -297,6 +307,7 @@ impl Node {
             None => return vec![],
         };
         let batch: Vec<AddrPayload> = peer.pending_relay.drain(..).collect();
+        peer.flush_scheduled = false;
         if batch.is_empty() {
             return vec![];
         }
@@ -389,6 +400,7 @@ impl Node {
             getaddr_recvd: false,
             addr_known: HashSet::new(),
             pending_relay: vec![],
+            flush_scheduled: false,
         };
         let mut events = vec![];
 
