@@ -102,7 +102,6 @@ pub struct AddrPayload {
 pub enum NetworkMessage {
     GetAddr,
     Addr(Vec<AddrPayload>),
-    AddrAnnounce(Vec<AddrPayload>),
 }
 
 #[derive(Clone)]
@@ -212,6 +211,7 @@ impl Node {
             entries.len(),
             if cache_hit { "hit" } else { "miss" }
         );
+        self.node_statistics.addr_sent += 1;
         vec![Event::SendMessage {
             from: self.own_addr_for_network(network),
             to: from,
@@ -220,17 +220,10 @@ impl Node {
         }]
     }
 
-    pub fn receive_addr(&mut self, addrs: Vec<AddrPayload>, now: u64) {
-        protocol_log!(now, self.node_id, "ADDR {} entries", addrs.len());
-        self.node_statistics.addr_received += 1;
-        const PENALTY: u64 = 2 * HOURS;
-        for payload in addrs {
-            self.addrman
-                .add(payload.address, payload.timestamp, PENALTY, now);
-        }
-    }
-
-    pub fn receive_addr_announce(
+    /// Handle a received `addr` message. Mirrors Bitcoin Core's `ProcessAddrs`.
+    /// Adds all entries to addrman, then relays fresh entries to outbound peers
+    /// unless the batch is large (GETADDR reply) or we sent GETADDR to this peer.
+    pub fn receive_addr(
         &mut self,
         from: AddressId,
         addrs: Vec<AddrPayload>,
@@ -239,14 +232,20 @@ impl Node {
         rng: &mut impl Rng,
     ) -> Vec<Event> {
         let batch_size = addrs.len();
-        protocol_log!(now, self.node_id, "AddrAnnounce {batch_size} entries from={from:?}");
-        self.node_statistics.addr_announce_received += 1;
+        let is_reply = self.out_peers.get(&from)
+            .or_else(|| self.in_peers.get(&from))
+            .map_or(false, |p| p.getaddr_sent);
+        protocol_log!(now, self.node_id, "ADDR {batch_size} entries from={from:?}");
+        if is_reply {
+            self.node_statistics.addr_received += 1;
+        } else {
+            self.node_statistics.addr_announce_received += 1;
+        }
         let mut events = vec![];
 
         for payload in &addrs {
             let penalty = if payload.address == from { 0 } else { 2 * HOURS };
-            self.addrman
-                .add(payload.address, payload.timestamp, penalty, now);
+            self.addrman.add(payload.address, payload.timestamp, penalty, now);
         }
 
         // Mark the sender as knowing all addresses they just sent us.
@@ -257,19 +256,12 @@ impl Node {
             }
         }
 
-        if batch_size > 10 {
+        if batch_size > 10 || is_reply {
             return events;
         }
 
-        let peer_sent_getaddr = self.out_peers.get(&from)
-            .or_else(|| self.in_peers.get(&from))
-            .map_or(false, |p| p.getaddr_sent);
-
         for payload in addrs {
             if payload.timestamp < now.saturating_sub(10 * 60) {
-                continue;
-            }
-            if peer_sent_getaddr {
                 continue;
             }
 
@@ -316,7 +308,7 @@ impl Node {
         vec![Event::SendMessage {
             from: self.own_addr_for_network(peer_addr.network),
             to: peer_addr,
-            msg: NetworkMessage::AddrAnnounce(batch),
+            msg: NetworkMessage::Addr(batch),
             at: now,
         }]
     }
@@ -368,19 +360,20 @@ impl Node {
             .copied();
 
         if let Some(addr) = own_addr {
-            self.node_statistics.addr_announce_sent += 1;
-            vec![Event::SendMessage {
-                from: addr,
-                to: peer_addr,
-                msg: NetworkMessage::AddrAnnounce(vec![AddrPayload {
-                    address: addr,
-                    timestamp: now,
-                }]),
-                at: now,
-            }]
-        } else {
-            vec![]
+            let peer = self.out_peers.get_mut(&peer_addr).or_else(|| self.in_peers.get_mut(&peer_addr));
+            if let Some(peer) = peer {
+                let need_flush = !peer.flush_scheduled;
+                if need_flush {
+                    peer.flush_scheduled = true;
+                }
+                peer.addr_known.insert(addr);
+                peer.pending_relay.push(AddrPayload { address: addr, timestamp: now });
+                if need_flush {
+                    return vec![Event::FlushAddrQueue { node_id: self.node_id, peer_addr, at: now + 30 }];
+                }
+            }
         }
+        vec![]
     }
 
     pub fn on_connect(

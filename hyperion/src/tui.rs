@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Terminal;
 
 use hyper_lib::address::{AddressRegistry, NetworkType};
-use hyper_lib::node::{Event, GetaddrCacheAlgorithm, NetworkMessage, NodeId};
+use hyper_lib::node::{AddrPayload, Event, GetaddrCacheAlgorithm, NetworkMessage, NodeId};
 use hyper_lib::simulator::Simulator;
 use hyper_lib::StartMode;
 
@@ -238,16 +238,14 @@ fn event_description(event: &Event, reg: &AddressRegistry) -> String {
             NetworkMessage::Addr(v) if v.is_empty() => {
                 format!("getaddr-reply(0) [empty addrman]  {} → {}", fmt_addr(from, reg), fmt_addr(to, reg))
             }
-            NetworkMessage::Addr(v) => {
+            NetworkMessage::Addr(v) if v.len() > 10 => {
                 format!("getaddr-reply({})  {} → {}", v.len(), fmt_addr(from, reg), fmt_addr(to, reg))
             }
-            NetworkMessage::AddrAnnounce(v) => {
-                let is_self = v.first().map_or(false, |p| p.address == *from);
-                if is_self {
-                    format!("self-announce  {} → {}", fmt_addr(from, reg), fmt_addr(to, reg))
-                } else {
-                    format!("relay-announce({})  {} → {}", v.len(), fmt_addr(from, reg), fmt_addr(to, reg))
-                }
+            NetworkMessage::Addr(v) if v.len() == 1 && v[0].address == *from => {
+                format!("self-announce  {} → {}", fmt_addr(from, reg), fmt_addr(to, reg))
+            }
+            NetworkMessage::Addr(v) => {
+                format!("addr-announce({})  {} → {}", v.len(), fmt_addr(from, reg), fmt_addr(to, reg))
             }
         },
         Event::SelfAnnounce { node_id, peer_addr, .. } => {
@@ -859,35 +857,13 @@ fn next_message_lines(app: &App) -> Vec<Line<'static>> {
                     )));
                 }
                 NetworkMessage::Addr(entries) => {
-                    lines.push(Line::from(vec![
-                        Span::styled("ADDR ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                        Span::styled(
-                            format!("({} entries)", entries.len()),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                    lines.push(Line::from(Span::styled(
-                        format!("  {:<12}  {:<7}  age", "node", "net"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    for p in entries {
-                        let net = match p.address.network {
-                            NetworkType::Onion => "onion",
-                            NetworkType::Clearnet => "clear",
-                        };
-                        let owner = reg.addresses.get(&p.address)
-                            .map(|a| a.owner_node.to_string())
-                            .unwrap_or_else(|| "?".to_string());
-                        let age = age_str(now, p.timestamp);
-                        lines.push(Line::from(format!(
-                            "  {:<12}  {:<7}  {}",
-                            owner, net, age
-                        )));
-                    }
-                }
-                NetworkMessage::AddrAnnounce(entries) => {
-                    let is_self = entries.first().map_or(false, |p| p.address == *from);
-                    let label = if is_self { "SELF-ANNOUNCE" } else { "ADDR-ANNOUNCE" };
+                    let label = if entries.len() > 10 {
+                        "GETADDR-REPLY"
+                    } else if entries.len() == 1 && entries[0].address == *from {
+                        "SELF-ANNOUNCE"
+                    } else {
+                        "ADDR-ANNOUNCE"
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                         Span::styled(
@@ -913,6 +889,50 @@ fn next_message_lines(app: &App) -> Vec<Line<'static>> {
                             owner, net, age
                         )));
                     }
+                }
+            }
+        }
+        Event::FlushAddrQueue { node_id, peer_addr, .. } => {
+            let reg = &app.simulator.network.registry;
+            lines.push(Line::from(vec![
+                Span::styled("FLUSH-ADDR-QUEUE", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("node  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(node_id.to_string(), Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("peer  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(fmt_addr(peer_addr, reg), Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(""));
+
+            let pending: Vec<AddrPayload> = app.simulator.network.nodes.get(node_id)
+                .and_then(|n| n.out_peers.get(peer_addr).or_else(|| n.in_peers.get(peer_addr)))
+                .map(|p| p.pending_relay.clone())
+                .unwrap_or_default();
+
+            if pending.is_empty() {
+                lines.push(Line::from(Span::styled("(queue empty)", Style::default().fg(Color::DarkGray))));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("queue ({} entries)", pending.len()),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("  {:<12}  {:<7}  age", "node", "net"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for p in &pending {
+                    let net = match p.address.network {
+                        NetworkType::Onion => "onion",
+                        NetworkType::Clearnet => "clear",
+                    };
+                    let owner = reg.addresses.get(&p.address)
+                        .map(|a| a.owner_node.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let age = age_str(now, p.timestamp);
+                    lines.push(Line::from(format!("  {:<12}  {:<7}  {}", owner, net, age)));
                 }
             }
         }
